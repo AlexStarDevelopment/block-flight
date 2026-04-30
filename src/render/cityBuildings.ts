@@ -100,7 +100,7 @@ export function buildCity(): CityBuildings {
   // Hash a lot's position to a deterministic prototype index, drawing from
   // the lot's preferred category. Estate lots prefer larger houses; commercial
   // suburban lots draw from suburban_commercial.
-  function pickProto(lot: Lot): BuildingPrototype {
+  function pickProto(lot: Lot): BuildingPrototype | null {
     const cat: BuildingPrototype['category'] =
       lot.preferCategory === 'suburban_commercial' ? 'suburban_commercial'
       : lot.preferCategory === 'downtown' ? 'downtown'
@@ -110,24 +110,27 @@ export function buildCity(): CityBuildings {
     const candidates = byCategory.get(cat) ?? prototypes;
     // For estate zone, bias toward larger house prototypes.
     const wantLarge = lot.zone === 'estate';
+    // Strict fit — building must not exceed the lot footprint, otherwise it
+    // overflows into the adjacent road. Lots with no candidate are left empty.
     const fitting = candidates.filter((p) => {
-      const fits = p.width <= lot.width + 8 && p.depth <= lot.depth + 8;
+      const fits = p.width <= lot.width && p.depth <= lot.depth;
       if (wantLarge) {
         // Estate: only houses with footprint area > 100 m².
         return fits && p.width * p.depth > 100;
       }
       return fits;
     });
-    const pool = fitting.length > 0 ? fitting : candidates;
+    if (fitting.length === 0) return null;
     const h = hash2(lot.x, lot.z);
-    const idx = Math.floor(h * pool.length) % pool.length;
-    return pool[idx];
+    const idx = Math.floor(h * fitting.length) % fitting.length;
+    return fitting[idx];
   }
 
   // Group lots by chosen prototype so each prototype gets one InstancedMesh.
   const instancesByProto = new Map<string, { proto: BuildingPrototype; lots: Lot[] }>();
   for (const lot of graph.lots) {
     const proto = pickProto(lot);
+    if (!proto) continue;     // no prototype fits — leave the lot empty
     let entry = instancesByProto.get(proto.id);
     if (!entry) {
       entry = { proto, lots: [] };

@@ -57,8 +57,12 @@ export interface CityGraph {
 const DOWNTOWN_BLOCK = 80;
 const MID_BLOCK = 130;
 const SUBURB_BRANCH_LEN = 320;
-const ROAD_SETBACK_DOWNTOWN = 6;
-const ROAD_SETBACK_HOUSE = 8;
+// Distance from the road CENTERLINE to the lot CENTER's near edge (= setback
+// + lotDepth/2 from road center). Must exceed the road's half-width (arterial
+// 6m, street 4m) plus a sidewalk margin so building front faces clear the
+// curb even when a max-size prototype fills its lot.
+const ROAD_SETBACK_DOWNTOWN = 10;
+const ROAD_SETBACK_HOUSE = 10;
 const FARMSTEAD_GRID = 1000;       // 1 km between farmsteads in rural ring
 const FARMSTEAD_OCCUPANCY = 0.45;  // 45% of grid cells host a farmstead
 const COMMERCIAL_SPACING_M = 480;  // every ~480m of arterial in suburb depth → commercial pocket
