@@ -18,7 +18,7 @@ const STORE = 'chunks';
 
 // Bump this string whenever terrain generation logic changes — old chunks
 // are then deleted on init. Keep the format <generation>-<short-tag>.
-export const CHUNK_CACHE_VERSION = 'v7f-river-cabin';
+export const CHUNK_CACHE_VERSION = 'v7j-water-waves';
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 let cacheReady = false;

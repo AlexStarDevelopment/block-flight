@@ -4,7 +4,7 @@ import { AIRPORTS, snapAirportElevations } from './world/airport';
 import { snapLandingSiteElevations, LANDING_SITES } from './world/landingSites';
 import { snapPoiElevations } from './world/pois';
 import { buildPoiMarkers } from './render/poiMarkers';
-import { groundNoiseHeight, heightAt } from './world/terrain';
+import { groundNoiseHeight, heightAt, SEA_LEVEL } from './world/terrain';
 import { World } from './world/world';
 import { initChunkCache } from './world/chunkCache';
 import { DistantTerrain } from './world/lod';
@@ -29,7 +29,7 @@ import { consumeCameraToggle, consumeReset, getControls, isKeyHeld, setFlapStage
 import { renderHUD, isFpiEnabled, setFpiEnabled } from './hud';
 import { mountWeatherPanel, getWeather, updateWindAt } from './weather';
 import { mountGps, updateGps } from './gps';
-import { MissionSystem, TIERS, destZoneCenter } from './missions';
+import { MissionSystem, TIERS, destZoneCenter, isSeaDestination } from './missions';
 import { buildCargoZones } from './render/cargoZones';
 import { initSound, updateSound, crashSound, touchdownSound } from './sound';
 import { loadSave, writeSave } from './saveState';
@@ -38,6 +38,7 @@ import { UPGRADES, type UpgradeKind } from './fleet';
 import { RANKS } from './missions';
 import { SKINS, getSkin } from './skins';
 import { mountCareerPanel, updateCareerPanel } from './careerPanel';
+import { checkAchievements, findAchievement } from './achievements';
 import { mountPerfHud } from './perfHud';
 import { makeStressFly } from './stressFly';
 
@@ -239,9 +240,13 @@ function applyActivePlane() {
     planeVisual.group.visible = true;
   }
   planeVisual.setColors(getSkin(fleet.activeSkinId()));
+  // Show pontoons under the plane only when the floats upgrade is owned.
+  for (const v of Object.values(planeVisuals)) v.setFloats(false);
+  if (params.hasFloats) planeVisual.setFloats(true);
   // Mission system needs to know plane capacity so it caps passenger jobs.
   missions.activePlaneId = id;
   missions.activePlaneSeats = PLANES[id].passengerSeats;
+  missions.activePlaneHasFloats = params.hasFloats === true;
 }
 applyActivePlane();
 let missionMessage = '';
@@ -275,8 +280,9 @@ helpPanel.innerHTML =
   `<div class="row"><span class="keys">free: <kbd>WASD</kbd> <kbd>Q</kbd><kbd>E</kbd></span><span class="desc">Move (Q down, E up). Hold <kbd>Shift</kbd> = faster. Click+drag = look.</span></div>` +
   `<div class="row"><span class="keys"><kbd>R</kbd></span><span class="desc">Reset / respawn at home</span></div>` +
   `<h4>Hangar &amp; missions</h4>` +
-  `<div class="row"><span class="keys"><kbd>H</kbd></span><span class="desc">Open hangar (auto-opens mission board)</span></div>` +
+  `<div class="row"><span class="keys"><kbd>H</kbd></span><span class="desc">Open hangar</span></div>` +
   `<div class="row"><span class="keys"><kbd>P</kbd></span><span class="desc">Quick-open mission board only</span></div>` +
+  `<div class="row"><span class="keys"><kbd>Shift</kbd>+<kbd>P</kbd></span><span class="desc">Cancel current mission (drops cargo, no payout)</span></div>` +
   `<div class="row"><span class="keys"><kbd>1</kbd>-<kbd>5</kbd></span><span class="desc">Pick a mission from the board</span></div>` +
   `<div class="row"><span class="keys"><kbd>1</kbd>-<kbd>4</kbd></span><span class="desc">In hangar: select / buy plane</span></div>` +
   `<div class="row"><span class="keys"><kbd>I</kbd> <kbd>O</kbd> <kbd>L</kbd> <kbd>T</kbd></span><span class="desc">In hangar: engine / cruise prop / climb prop / aux tank</span></div>` +
@@ -298,7 +304,8 @@ document.body.appendChild(helpPanel);
 window.addEventListener('keydown', (e) => {
   if (e.repeat) return;
   if (e.code === 'KeyP') {
-    missionMessage = missions.interact(plane);
+    // Shift+P abandons the current mission (assigned or loaded).
+    missionMessage = e.shiftKey ? missions.cancelMission(plane) : missions.interact(plane);
     missionMessageTimer = 5;
   } else if (e.code === 'KeyZ') {
     // Z toggles fullscreen — in fullscreen, Ctrl+W/T/etc browser shortcuts
@@ -326,22 +333,14 @@ window.addEventListener('keydown', (e) => {
     const speed = Math.hypot(plane.vel.x, plane.vel.z);
     if (hangarOpen) {
       hangarOpen = false;
-      if (missions.boardOpen) missions.closeBoard();
     } else if (ap && plane.onGround && speed < 3) {
       hangarOpen = true;
-      // Hangar = hub, so the mission board comes up alongside it. Only when
-      // not mid-mission (don't replace ASSIGNED/LOADED status).
-      const phase = missions.state.phase;
-      if ((phase === 'idle' || phase === 'completed' || phase === 'expired') && !missions.boardOpen) {
-        missions.openBoard(ap);
-      }
     } else {
       missionMessage = 'Stop on an apron to open the hangar.';
       missionMessageTimer = 3;
     }
   } else if (hangarOpen && e.code === 'Escape') {
     hangarOpen = false;
-    if (missions.boardOpen) missions.closeBoard();
   } else if (missions.boardOpen && e.code.startsWith('Digit')) {
     const n = parseInt(e.code.slice(5), 10) - 1;
     if (!Number.isNaN(n)) {
@@ -374,15 +373,18 @@ window.addEventListener('keydown', (e) => {
     missionMessageTimer = 4;
   } else if (hangarOpen && (
     e.code === 'KeyI' || e.code === 'KeyO' || e.code === 'KeyL' ||
-    e.code === 'KeyT' || e.code === 'Semicolon' || e.code === 'Quote'
+    e.code === 'KeyT' || e.code === 'Semicolon' || e.code === 'Quote' ||
+    e.code === 'Backslash'
   )) {
     const kind: UpgradeKind = e.code === 'KeyI' ? 'engine'
       : e.code === 'KeyO' ? 'prop_cruise'
       : e.code === 'KeyL' ? 'prop_climb'
       : e.code === 'KeyT' ? 'tank'
       : e.code === 'Semicolon' ? 'vortex_gen'
-      : 'alpine_tires';
-    missionMessage = buyUpgrade(kind);
+      : e.code === 'Quote' ? 'alpine_tires'
+      : 'floats';
+    // Shift modifier: unequip / refund a level instead of buying.
+    missionMessage = e.shiftKey ? sellUpgrade(kind) : buyUpgrade(kind);
     missionMessageTimer = 4;
   }
 });
@@ -447,15 +449,32 @@ function buyUpgrade(kind: UpgradeKind): string {
   const spec = UPGRADES.find(u => u.kind === kind);
   if (!spec) return '';
   const cur = fleet.upgradeLevel(kind);
-  if (cur >= spec.maxLevel) return `${spec.name} already at max level.`;
-  if (kind === 'prop_cruise' && fleet.upgradeLevel('prop_climb') > 0) return 'Climb prop installed — uninstall not supported.';
-  if (kind === 'prop_climb' && fleet.upgradeLevel('prop_cruise') > 0) return 'Cruise prop installed — uninstall not supported.';
+  if (cur >= spec.maxLevel) return `${spec.name} already at max level. Shift+key to unequip.`;
+  if (kind === 'prop_cruise' && fleet.upgradeLevel('prop_climb') > 0) return 'Climb prop installed — Shift+L to unequip first.';
+  if (kind === 'prop_climb' && fleet.upgradeLevel('prop_cruise') > 0) return 'Cruise prop installed — Shift+O to unequip first.';
   const cost = spec.costPerLevel(PLANES[fleet.active().id].cost);
   if (missions.cash < cost) return `${spec.name} costs $${cost} — you have $${missions.cash}.`;
   missions.cash -= cost;
   fleet.buyUpgrade(kind);
   applyActivePlane();
   return `Installed ${spec.name} (level ${cur + 1}). -$${cost}.`;
+}
+
+function sellUpgrade(kind: UpgradeKind): string {
+  const spec = UPGRADES.find(u => u.kind === kind);
+  if (!spec) return '';
+  const cur = fleet.upgradeLevel(kind);
+  if (cur <= 0) return `${spec.name} not installed.`;
+  const refund = fleet.sellUpgrade(kind);
+  if (refund === null) return '';
+  missions.cash += refund;
+  // Clamp current fuel to the new (possibly smaller) tank capacity.
+  const cap = fleet.effectiveTankGallons();
+  if (plane.fuelGallons > cap) plane.fuelGallons = cap;
+  applyActivePlane();
+  const newLevel = fleet.upgradeLevel(kind);
+  const tag = newLevel > 0 ? `now level ${newLevel}` : 'removed';
+  return `Unequipped ${spec.name} (${tag}). +$${refund} refund.`;
 }
 
 function airportAtPlane() {
@@ -531,17 +550,21 @@ function renderHangar(airportName: string): string {
       : u.kind === 'tank' ? 'T'
       : u.kind === 'vortex_gen' ? ';'
       : u.kind === 'alpine_tires' ? "'"
+      : u.kind === 'floats' ? '\\'
       : '?';
     const status = cur >= u.maxLevel
       ? '<span style="color:#7cffb3">MAX</span>'
       : blocked
       ? '<span style="color:#888">blocked</span>'
       : `<span style="color:${missions.cash >= cost ? '#7cffb3' : '#ff7060'}">$${cost}</span>`;
+    const unequipHint = cur > 0
+      ? '<span style="color:#888;font-size:11px"> · Shift+key to unequip</span>'
+      : '';
     return (
       `<tr>` +
       `<td style="padding:2px 8px;color:#ffcb6b"><b>${key}</b></td>` +
       `<td style="padding:2px 8px">${u.name} <span style="color:#666;font-size:11px">${u.description}</span></td>` +
-      `<td style="padding:2px 8px;color:#888">Lvl ${cur}/${u.maxLevel}</td>` +
+      `<td style="padding:2px 8px;color:#888">Lvl ${cur}/${u.maxLevel}${unequipHint}</td>` +
       `<td style="padding:2px 8px">${status}</td>` +
       `</tr>`
     );
@@ -571,7 +594,7 @@ function renderHangar(airportName: string): string {
     `<table style="border-collapse:collapse;width:100%">${upgradeRows}</table>` +
     renderSkinSection() +
     `<div style="text-align:center;color:#5aa080;font-size:11px;margin-top:10px">` +
-    `1-4 plane · I engine · O cruise prop · L climb prop · T tank · ; vortex gen · ' alpine tires<br>` +
+    `1-4 plane · I engine · O cruise prop · L climb prop · T tank · ; vortex gen · ' alpine tires (Shift+key unequips)<br>` +
     `,/. skins · B buy skin · Hold U fill · Hold Y drain · Esc/H close</div>`
   );
 }
@@ -621,6 +644,7 @@ function tickFuelHold(dt: number) {
       if (missions.cash >= cost) {
         missions.cash -= cost;
         plane.fuelGallons += add;
+        if (plane.fuelGallons > 0) plane.engineDead = false;
       }
     }
   }
@@ -633,7 +657,10 @@ const missionPanel = document.createElement('div');
 missionPanel.id = 'missionPanel';
 Object.assign(missionPanel.style, {
   position: 'fixed',
-  top: '12px',
+  // Below the compass tape (which sits at y=12, ends at ~y=70 with numeric
+  // heading + nearest airport pointer). Keeps the mission text out of the
+  // compass area.
+  top: '85px',
   left: '50%',
   transform: 'translateX(-50%)',
   background: 'rgba(20, 22, 28, 0.85)',
@@ -754,9 +781,17 @@ teleportSelect.addEventListener('change', () => {
     const z = destZoneCenter(s);
     const sx = z.x;
     const sz = z.z;
-    const h = heightAt(Math.floor(sx), Math.floor(sz));
-    const surfaceY = Math.floor(h / 2) * 2 + 2;
-    plane.reset(new THREE.Vector3(sx, spawnY(surfaceY), sz), -Math.PI / 2);
+    if (s.isSeaplaneBase) {
+      // Sea bases: terrain is the seabed, way below sea level. Spawn just
+      // above the actual VISIBLE water surface (top of the highest water
+      // voxel = SEA_LEVEL + 2 m) so the float plane settles at the waterline.
+      const surfaceY = SEA_LEVEL + 2;
+      plane.reset(new THREE.Vector3(sx, spawnY(surfaceY), sz), -Math.PI / 2);
+    } else {
+      const h = heightAt(Math.floor(sx), Math.floor(sz));
+      const surfaceY = Math.floor(h / 2) * 2 + 2;
+      plane.reset(new THREE.Vector3(sx, spawnY(surfaceY), sz), -Math.PI / 2);
+    }
   }
   plane.vel.set(0, 0, 0);
   setThrottle(0);
@@ -1013,6 +1048,7 @@ function tick() {
   // Halos brighten as the sun goes down — full effect by deep dusk.
   const nightFactor = 1 - Math.min(1, Math.max(0, (sun.intensity - 0.05) / 0.5));
   runwayLights.setNightFactor(nightFactor);
+  cityBuildings.setNightFactor(nightFactor);
   skyEffects.update(sun, camera, sun.intensity);
   cloudLayer.update(camera.position, performance.now() / 1000, weather.windVector.x, weather.windVector.z);
 
@@ -1120,7 +1156,7 @@ function tick() {
     const left = Math.max(0, m.deadlineSec - missions.state.elapsedSec);
     const label = m.type === 'medevac' ? 'MEDEVAC ENROUTE' : 'ASSIGNED';
     missionTxt = `${label}  ${m.cargoName} ${m.cargoKg}kg  pickup at ${m.from.name} → ${m.to.name}  $${m.payout}\n` +
-                 `Land at ${m.from.name} and press P to load.   ${formatTime(left)} left`;
+                 `Land at ${m.from.name} and press P to load.   ${formatTime(left)} left   Shift+P cancels.`;
   } else if (missions.state.phase === 'loaded') {
     const m = missions.state.mission;
     const left = Math.max(0, m.deadlineSec - missions.state.elapsedSec);
@@ -1151,7 +1187,7 @@ function tick() {
       missionTxt = `SURVEY  ${idx}/${wpc} hit  $${m.payout}\n${nextLine}   ${formatTime(left)} left`;
     } else {
       missionTxt = `IN TRANSIT  ${m.cargoName} ${m.cargoKg}kg → ${m.to.name}  $${m.payout}\n` +
-                   `Land at ${m.to.name} and taxi to its yellow zone, then press P.   ${formatTime(left)} left`;
+                   `Land at ${m.to.name} and taxi to its yellow zone, then press P.   ${formatTime(left)} left   Shift+P cancels.`;
     }
   } else if (missions.state.phase === 'completed') {
     missionTxt = `DELIVERED  +$${missions.state.payout}  (landing ${missions.state.landingScore}/100)\n` +
@@ -1202,11 +1238,14 @@ function tick() {
         : m.type === 'passenger'
         ? `<span style="color:#c4a8ff;font-weight:bold">PAX</span>`
         : `<span style="color:${tier.color};font-size:10px;font-weight:bold">${tier.label}</span>`;
+      const seaBadge = (isSeaDestination(m.to) || isSeaDestination(m.from))
+        ? ` <span title="Seaplane base — requires floats" style="color:#5acfe0;font-weight:bold">⚓</span>`
+        : '';
       const route = m.type === 'medevac'
-        ? `<span style="color:#ff8a8a">${m.from.name}</span> → <span style="color:#9fd0ff">${m.to.name}</span>`
+        ? `<span style="color:#ff8a8a">${m.from.name}</span> → <span style="color:#9fd0ff">${m.to.name}</span>${seaBadge}`
         : m.type === 'survey'
         ? `${m.waypoints?.length ?? 0} pts ~${m.waypoints?.[0].targetAglM ?? 0}m AGL`
-        : `→ ${m.to.name}`;
+        : `→ ${m.to.name}${seaBadge}`;
       return (
         `<tr>` +
         `<td style="color:#ffcb6b;padding-right:10px"><b>${i + 1}</b></td>` +
@@ -1237,6 +1276,19 @@ function tick() {
   }
 
   updateCareerPanel(missions);
+  // Check achievements and notify on fresh unlocks.
+  const justUnlocked = checkAchievements({ plane, missions, fleet }, missions.unlockedAchievements);
+  for (const id of justUnlocked) {
+    const a = findAchievement(id);
+    if (a) {
+      missionMessage = `🏆 ACHIEVEMENT — ${a.icon} ${a.name}`;
+      missionMessageTimer = 6;
+    }
+  }
+  if (justUnlocked.length > 0) {
+    fleet.active().fuelGallons = plane.fuelGallons;
+    writeSave(missions, fleet);
+  }
   updateLoadingOverlay();
 
   if (perfHud.enabled) {

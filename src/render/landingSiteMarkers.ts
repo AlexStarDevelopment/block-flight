@@ -1,6 +1,11 @@
 import * as THREE from 'three';
 import { LANDING_SITES, TIGHT_WATER_SITES, type LandingSite } from '../world/landingSites';
+import { SEA_LEVEL } from '../world/terrain';
+import { VOXEL_SIZE } from '../world/voxel';
 import { buildWindsock } from './windsock';
+
+// Visible top of the water = top face of the highest water voxel.
+const WATER_SURFACE_Y = SEA_LEVEL + VOXEL_SIZE;
 
 // Visual markers for off-airport landing sites: small windsock at one end,
 // stone cairns at the four strip corners, and tinted ground patch matching
@@ -32,6 +37,12 @@ export function buildLandingSiteMarkers(): {
   for (const s of LANDING_SITES) {
     const halfL = s.length / 2;
     const halfW = s.width / 2;
+
+    // Sea plane bases get a floating dock instead of a strip + cairns + pole.
+    if (s.isSeaplaneBase) {
+      addSeaplaneDock(group, s, windsockUpdaters);
+      continue;
+    }
 
     // Tinted ground patch sitting just above voxel surface (which is forced
     // flat to s.elev by landingSiteSampleAt). Matches surface type.
@@ -117,12 +128,120 @@ export function buildLandingSiteMarkers(): {
 }
 
 // Cargo zone for a landing site: 8m east of the strip edge, centered along
-// it — except for tight water sites (Riverbar) where east is in the river.
-// Those get their zone placed on the strip itself, offset along the axis.
+// it — except for tight water sites (Riverbar) where east is in the river,
+// and seaplane bases where the cargo zone sits in open water just south of
+// the floating dock (so the plane can actually taxi into it).
 // MUST stay in sync with destZoneCenter in missions.ts.
 export function landingSiteCargoZone(s: LandingSite): { x: number; z: number } {
+  if (s.isSeaplaneBase) return { x: s.cx + 18, z: s.cz - 13 };   // water alongside dock
   if (TIGHT_WATER_SITES.has(s.name)) return { x: s.cx, z: s.cz - s.length / 3 };
   return { x: s.cx + s.width / 2 + 8, z: s.cz };
+}
+
+// Floating dock + windsock + cargo zone for sea plane bases. The dock sits
+// at sea level (anchored to one bank of the carved water bowl). Windsock
+// at the seaward end. Cargo zone painted ON the dock surface.
+function addSeaplaneDock(
+  group: THREE.Group,
+  s: LandingSite,
+  windsockUpdaters: { update: (w: THREE.Vector3) => void }[],
+) {
+  const matDeck = new THREE.MeshLambertMaterial({ color: 0x6a4a2a });
+  const matPost = new THREE.MeshLambertMaterial({ color: 0x4a3220 });
+  const matZone = new THREE.MeshBasicMaterial({
+    color: 0xffd24a, transparent: true, opacity: 0.85,
+    polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3,
+  });
+  const matZoneFill = new THREE.MeshBasicMaterial({
+    color: 0xffd24a, transparent: true, opacity: 0.18, depthWrite: false,
+  });
+  // Anchor everything to the VISIBLE water surface (top face of the highest
+  // water voxel), not raw SEA_LEVEL — otherwise the dock + zone end up
+  // submerged because the water mesh sits VOXEL_SIZE meters above SEA_LEVEL.
+  const SEA = WATER_SURFACE_Y;
+  const deckY = SEA + 1.0;       // dock surface 1m above water
+  // Main floating deck — long rectangle reaching out from the eastern shore.
+  const deck = new THREE.Mesh(
+    new THREE.BoxGeometry(28, 0.4, 14),
+    matDeck,
+  );
+  deck.position.set(s.cx + 18, deckY, s.cz);
+  group.add(deck);
+  // Pilings under the deck.
+  for (const dx of [-12, -4, 4, 12]) {
+    for (const dz of [-6, 6]) {
+      const post = new THREE.Mesh(
+        new THREE.BoxGeometry(0.4, 4, 0.4),
+        matPost,
+      );
+      post.position.set(s.cx + 18 + dx, deckY - 2, s.cz + dz);
+      group.add(post);
+    }
+  }
+  // Bollards / cleats on dock corners.
+  for (const dx of [-12, 12]) {
+    for (const dz of [-6, 6]) {
+      const cleat = new THREE.Mesh(
+        new THREE.BoxGeometry(0.5, 0.6, 0.5),
+        matPost,
+      );
+      cleat.position.set(s.cx + 18 + dx, deckY + 0.3, s.cz + dz);
+      group.add(cleat);
+    }
+  }
+  // Walkway connecting dock to land (short ramp east).
+  const ramp = new THREE.Mesh(
+    new THREE.BoxGeometry(8, 0.3, 3),
+    matDeck,
+  );
+  ramp.position.set(s.cx + 36, deckY - 0.3, s.cz);
+  group.add(ramp);
+  // Tall identification pole at the north end of the dock with a flag.
+  const matPoleBody = new THREE.MeshLambertMaterial({ color: 0xfafafa });
+  const matPoleFlag = new THREE.MeshBasicMaterial({ color: 0x2e88a0 });
+  const pole = new THREE.Mesh(new THREE.BoxGeometry(0.35, 12, 0.35), matPoleBody);
+  pole.position.set(s.cx + 8, deckY + 6, s.cz - 7);
+  group.add(pole);
+  const flag = new THREE.Mesh(new THREE.BoxGeometry(2.0, 1.4, 0.08), matPoleFlag);
+  flag.position.set(s.cx + 9.2, deckY + 11, s.cz - 7);
+  group.add(flag);
+  // Windsock at the south end (always present for sea bases — wind reading
+  // matters most when landing on glassy water).
+  const ws = buildWindsock();
+  ws.group.position.set(s.cx + 8, deckY, s.cz + 7);
+  group.add(ws.group);
+  windsockUpdaters.push(ws);
+  // Cargo zone painted on the WATER just south of the dock — the plane
+  // (on floats) physically taxis into the zone alongside the dock. Sits
+  // a hair above the visible water surface so it's always seen on top.
+  const zx = s.cx + 18;
+  const zz = s.cz - 13;
+  const zoneY = WATER_SURFACE_Y + 0.15;
+  const zoneSize = 14;
+  const t = 0.4;
+  const h = 0.05;
+  for (const [dx, dz, sw, sd] of [
+    [0, -zoneSize / 2, zoneSize, t],
+    [0, zoneSize / 2, zoneSize, t],
+    [-zoneSize / 2, 0, t, zoneSize],
+    [zoneSize / 2, 0, t, zoneSize],
+  ] as const) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(sw, h, sd), matZone);
+    m.position.set(zx + dx, zoneY, zz + dz);
+    group.add(m);
+  }
+  for (const ang of [Math.PI / 4, -Math.PI / 4]) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(zoneSize * 1.1, h, t), matZone);
+    m.position.set(zx, zoneY, zz);
+    m.rotation.y = ang;
+    group.add(m);
+  }
+  const fill = new THREE.Mesh(
+    new THREE.BoxGeometry(zoneSize, 0.012, zoneSize),
+    matZoneFill,
+  );
+  fill.position.set(zx, zoneY - 0.01, zz);
+  group.add(fill);
 }
 
 // Per-name landmarks — match the strip's identity. Cabins get cabins, piers

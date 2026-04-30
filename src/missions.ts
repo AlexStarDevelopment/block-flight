@@ -19,6 +19,8 @@ export function isLandingSite(d: Destination): d is LandingSite {
 
 export function destZoneCenter(d: Destination): { x: number; z: number } {
   if (!isLandingSite(d)) return { x: d.cx + d.apronWidth / 2 + 14, z: d.cz };
+  // Sea bases: zone sits in open water alongside the floating dock.
+  if (d.isSeaplaneBase) return { x: d.cx + 18, z: d.cz - 13 };
   // Tight water sites (Riverbar) have water right against the strip — placing
   // the zone perpendicular to the strip puts it in the river. Park it on the
   // gravel bar itself, offset along the strip axis.
@@ -29,6 +31,16 @@ export function destZoneCenter(d: Destination): { x: number; z: number } {
 export function destZoneSize(d: Destination): number {
   return isLandingSite(d) ? 15 : 22;
 }
+
+// True if the destination is a water-only seaplane base. Used to gate mission
+// availability behind the floats upgrade and to apply a sea-leg pay bonus.
+export function isSeaDestination(d: Destination): boolean {
+  return isLandingSite(d) && d.isSeaplaneBase === true;
+}
+
+// Sea legs pay 1.5× because they need the floats upgrade and you can't divert
+// to a runway if things go sideways.
+const SEA_PAY_MUL = 1.5;
 
 export type MissionTier = 'routine' | 'demanding' | 'critical';
 
@@ -119,6 +131,11 @@ export class MissionSystem {
   // Cub player never gets offered a 6-pax flight. Updated by main.ts on swap.
   activePlaneSeats: number = 1;
   activePlaneId: PlaneId = 'cub';
+  // True when the active plane has the floats upgrade. Used to gate sea-base
+  // missions and apply a sea-leg pay multiplier.
+  activePlaneHasFloats = false;
+  // Achievements — set of unlocked ids. Persists in saveState.
+  unlockedAchievements: Set<string> = new Set();
   // Mission board: list of jobs the player can accept while at a cargo zone.
   // Open when boardOpen=true, populated with up to 5 missions.
   boardOpen = false;
@@ -173,25 +190,37 @@ export class MissionSystem {
     this.boardAirport = null;
   }
 
+  // Player-initiated abort. Drops cargo, returns to idle so a new mission can
+  // be picked. No payout, but no penalty either.
+  cancelMission(plane: Plane): string {
+    if (this.state.phase !== 'assigned' && this.state.phase !== 'loaded') {
+      return 'No mission to cancel.';
+    }
+    const m = this.state.mission;
+    plane.cargoKg = 0;
+    this.state = { phase: 'idle' };
+    return `Cancelled: ${m.cargoName} → ${m.to.name}.`;
+  }
+
   // Player picks job index n (0-based). For cargo: loads immediately. For
   // medevac: state goes to 'assigned' (fly out empty to the rescue site first).
   selectMission(plane: Plane, n: number): string {
     if (!this.boardOpen) return '';
     if (n < 0 || n >= this.availableMissions.length) return `No job #${n + 1}.`;
     const m = this.availableMissions[n];
-    // MTOW check applies even though medevac doesn't load now — the patient
-    // weight WILL be added once you pick them up, so reject if you'd overload.
+    // MTOW projection — accept the mission either way, but warn the player so
+    // they know they'll need to burn fuel or unload before the plane will fly.
     const fuelKg = plane.fuelGallons * Plane.GAL_TO_KG;
     const projected = plane.params.mass + fuelKg + m.cargoKg;
+    let overweightWarning = '';
     if (projected > plane.params.maxMass) {
       const over = Math.ceil(projected - plane.params.maxMass);
-      const headroom = Math.floor(plane.params.maxMass - plane.params.mass - fuelKg);
-      return `Overweight! ${m.cargoKg} kg cargo → ${over} kg over MTOW. Burn fuel or pick lighter cargo (you have ${headroom} kg payload).`;
+      overweightWarning = ` WARNING: ${over} kg over MTOW — engine will not run until you burn fuel or shed cargo.`;
     }
     if (m.type === 'medevac') {
       this.state = { phase: 'assigned', mission: m, elapsedSec: 0 };
       this.closeBoard();
-      return `MEDEVAC accepted. Fly to ${m.from.name} to pick up the patient, then to ${m.to.name}.`;
+      return `MEDEVAC accepted. Fly to ${m.from.name} to pick up the patient, then to ${m.to.name}.${overweightWarning}`;
     }
     if (m.type === 'survey') {
       // No cargo; player flies through waypoints and the mission auto-completes
@@ -199,13 +228,13 @@ export class MissionSystem {
       this.state = { phase: 'loaded', mission: m, elapsedSec: 0 };
       this.closeBoard();
       const wpc = m.waypoints?.length ?? 0;
-      return `SURVEY accepted. Fly through ${wpc} photo points at ~${m.waypoints?.[0].targetAglM} m AGL.`;
+      return `SURVEY accepted. Fly through ${wpc} photo points at ~${m.waypoints?.[0].targetAglM} m AGL.${overweightWarning}`;
     }
     plane.cargoKg = m.cargoKg;
     if (m.type === 'passenger') plane.resetComfort();
     this.state = { phase: 'loaded', mission: m, elapsedSec: 0 };
     this.closeBoard();
-    return `Accepted: ${m.cargoName} (${m.cargoKg} kg) → ${m.to.name} for $${m.payout}. Cargo loaded.`;
+    return `Accepted: ${m.cargoName} (${m.cargoKg} kg) → ${m.to.name} for $${m.payout}. Cargo loaded.${overweightWarning}`;
   }
 
   newMission(currentAirport: Airport, tier: MissionTier = 'routine'): Mission {
@@ -257,13 +286,19 @@ export class MissionSystem {
       };
     }
 
+    // Pool of landing sites the player can actually reach with their current
+    // setup — float-only sea bases drop out unless they own the upgrade.
+    const reachableSites = this.activePlaneHasFloats
+      ? LANDING_SITES
+      : LANDING_SITES.filter(s => !s.isSeaplaneBase);
+
     // Med evac: pickup is at a landing site (patient stranded in the bush),
     // delivery is at any airport (hospital). Always critical-tier-grade
     // urgency regardless of the rolled tier, and a much bigger landing bonus.
     // We only roll med evac at higher tiers where the player has the chops.
     const medEvacChance = tier === 'critical' ? 0.4 : tier === 'demanding' ? 0.15 : 0;
-    if (Math.random() < medEvacChance && LANDING_SITES.length > 0) {
-      const from = LANDING_SITES[Math.floor(Math.random() * LANDING_SITES.length)];
+    if (Math.random() < medEvacChance && reachableSites.length > 0) {
+      const from = reachableSites[Math.floor(Math.random() * reachableSites.length)];
       const hospitals = AIRPORTS;       // any airport counts as a hospital
       const to = hospitals[Math.floor(Math.random() * hospitals.length)];
       const distKm = Math.hypot(to.cx - from.cx, to.cz - from.cz) / 1000;
@@ -272,7 +307,8 @@ export class MissionSystem {
       // Patient is light; the value is in keeping them alive. Pickup site
       // difficulty (most medevac sites are remote) scales the payout.
       const fromDiff = DIFFICULTY_PAYOUT_MUL[from.difficulty];
-      const payout = Math.round((400 + totalDistKm * 220) * fromDiff);
+      const seaMul = isSeaDestination(from) ? SEA_PAY_MUL : 1;
+      const payout = Math.round((400 + totalDistKm * 220) * fromDiff * seaMul);
       // Tight: roughly 4 minutes per km of TOTAL flight (out + back).
       const deadlineSec = 240 + totalDistKm * 240;
       return {
@@ -319,7 +355,7 @@ export class MissionSystem {
 
     // Standard cargo: pickup here, deliver to another airport or landing site.
     const otherAirports: Destination[] = AIRPORTS.filter(a => a !== currentAirport);
-    const sites: Destination[] = LANDING_SITES.slice();
+    const sites: Destination[] = reachableSites.slice();
     const lsBias = tier === 'critical' ? 0.65 : tier === 'demanding' ? 0.45 : 0.25;
     const useLandingSite = Math.random() < lsBias && sites.length > 0;
     const pool = useLandingSite ? sites : otherAirports;
@@ -331,7 +367,8 @@ export class MissionSystem {
     const basePayout = cargo.payRate * distKm * (cargo.kg / 50);
     // Pay scales with destination difficulty: easy → impossible = 1.0 → 3.0x.
     const diffMul = DIFFICULTY_PAYOUT_MUL[to.difficulty];
-    const payout = Math.round(basePayout * spec.payoutMul * diffMul);
+    const seaMul = isSeaDestination(to) ? SEA_PAY_MUL : 1;
+    const payout = Math.round(basePayout * spec.payoutMul * diffMul * seaMul);
     const deadlineSec = (360 + distKm * 180) * spec.deadlineMul;
     return {
       cargoName: cargo.name,

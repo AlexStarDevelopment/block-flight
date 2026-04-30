@@ -2,6 +2,11 @@ import * as THREE from 'three';
 import { computeAero, SUPER_CUB, type AircraftParams, type ControlInput, type AeroResult } from './aero';
 import { biomeAt, heightAt, SEA_LEVEL } from '../world/terrain';
 import { VOXEL_SIZE } from '../world/voxel';
+
+// SEA_LEVEL=28 is the world-Y of the TOP water VOXEL; the visible top face of
+// that voxel sits one voxel higher (water surface Y = 30 with VOXEL_SIZE=2).
+// All physics that interacts with the visible water surface must use this.
+const WATER_SURFACE_Y = SEA_LEVEL + VOXEL_SIZE;
 import { isIcySurfaceAt } from '../world/landingSites';
 import { tempCAt } from '../weather';
 import { getCityHazards } from '../render/cityInfra';
@@ -132,13 +137,16 @@ interface GearPoint {
 
 // Body box used for crash detection. Each entry is a body-frame point that
 // shouldn't touch the ground. We sample the heightAt under each.
-const CRASH_PROBES: THREE.Vector3[] = [
-  new THREE.Vector3(0, 0, 3.5),       // nose
-  new THREE.Vector3(-5.0, 1.0, 0.4),  // left wingtip
-  new THREE.Vector3(5.0, 1.0, 0.4),   // right wingtip
-  new THREE.Vector3(0, 0.7, -3.6),    // tail vstab
-  new THREE.Vector3(-1.6, 1.0, 0.4),  // left wing inboard
-  new THREE.Vector3(1.6, 1.0, 0.4),   // right wing inboard
+// `wingtip` flag: true for wingtips — the only probes that fire a water strike
+// for float planes (since pontoons handle the nose/tail/inboard).
+interface CrashProbe { p: THREE.Vector3; wingtip: boolean; }
+const CRASH_PROBES: CrashProbe[] = [
+  { p: new THREE.Vector3(0, 0, 3.5),      wingtip: false }, // nose
+  { p: new THREE.Vector3(-5.0, 1.0, 0.4), wingtip: true  }, // left wingtip
+  { p: new THREE.Vector3(5.0, 1.0, 0.4),  wingtip: true  }, // right wingtip
+  { p: new THREE.Vector3(0, 0.7, -3.6),   wingtip: false }, // tail vstab
+  { p: new THREE.Vector3(-1.6, 1.0, 0.4), wingtip: false }, // left wing inboard
+  { p: new THREE.Vector3(1.6, 1.0, 0.4),  wingtip: false }, // right wing inboard
 ];
 
 export class Plane {
@@ -163,6 +171,7 @@ export class Plane {
 
   lastAero: AeroResult | null = null;
   onGround = false;
+  onWater = false;        // float plane is in water contact (any gear)
   gearCompression: [number, number, number] = [0, 0, 0];
   propAdvance = 0;
 
@@ -172,6 +181,10 @@ export class Plane {
   idleGph = 5;
   fullGph = 13;
   cargoKg = 0;
+  // True once fuel has run out. Stays true until refueling; while set,
+  // throttle is forced to 0 in step() so the engine produces no thrust even
+  // if the player keeps the throttle key held.
+  engineDead = false;
   static GAL_TO_KG = 2.72;   // ~6 lb/gal avgas — same fuel for all planes
 
   totalMass(): number {
@@ -186,6 +199,7 @@ export class Plane {
     this.idleGph = idleGph;
     this.fullGph = fullGph;
     this.fuelGallons = Math.min(fuelGal, capacityGal);
+    this.engineDead = this.fuelGallons <= 0;
     this.cargoKg = 0;
     this.crashed = false;
     this.crashCause = '';
@@ -209,11 +223,22 @@ export class Plane {
     // own gear placement so the visual mesh's wheels actually meet the ground.
     // Defaults match the Cub silhouette / Caravan turbine stance.
     const tricycle = params.gearLayout === 'tricycle';
-    const gx = params.gearMainX ?? (tricycle ? 1.5 : 1.4);
-    const gy = params.gearMainY ?? (tricycle ? -1.4 : -0.9);
-    const gz = params.gearMainZ ?? (tricycle ? -0.3 : 0.6);
-    const tgy = params.gearThirdY ?? (tricycle ? -1.4 : -0.5);
-    const tgz = params.gearThirdZ ?? (tricycle ? 2.5 : -3.2);
+    const gx0 = params.gearMainX ?? (tricycle ? 1.5 : 1.4);
+    const gy0 = params.gearMainY ?? (tricycle ? -1.4 : -0.9);
+    const gz0 = params.gearMainZ ?? (tricycle ? -0.3 : 0.6);
+    const tgy0 = params.gearThirdY ?? (tricycle ? -1.4 : -0.5);
+    const tgz0 = params.gearThirdZ ?? (tricycle ? 2.5 : -3.2);
+    // Float plane: gear contact moves DOWN to the pontoon bottom (the wheel
+    // is inside the pontoon and touches ground at the pontoon-bottom plane).
+    // Also widen the stance — pontoons sit further apart than the wheels.
+    // This places the pontoon visual cleanly below the fuselage with a gap
+    // for visible struts, the way real float planes look.
+    const onFloats = params.hasFloats === true;
+    const gx = onFloats ? gx0 + 0.3 : gx0;
+    const gy = onFloats ? gy0 - 0.6 : gy0;
+    const gz = gz0;
+    const tgy = onFloats ? tgy0 - 0.6 : tgy0;
+    const tgz = tgz0;
     this.gear[0].pos.set(-gx, gy, gz);
     this.gear[1].pos.set(gx, gy, gz);
     this.gear[2].pos.set(0, tgy, tgz);
@@ -279,6 +304,7 @@ export class Plane {
     this.propStrike = false;
     this.propStrikeCooldown = 0;
     this.fuelGallons = this.fuelMaxGallons;
+    this.engineDead = false;
     this.cargoKg = 0;
     this.passengerComfort = 100;
     this.prevVelY = 0;
@@ -299,6 +325,15 @@ export class Plane {
     const altitude = this.pos.y;
     const agl = this.altitudeAGL();
 
+    // Engine starvation: zero throttle BEFORE aero so no thrust is produced
+    // this frame. Stays dead until refueling clears the flag. Overweight
+    // operation — over MTOW — also forces throttle to 0; the engine simply
+    // can't produce useful power for an over-grossed airframe in this sim, so
+    // the player has to burn fuel or shed cargo before it'll fly.
+    if (this.engineDead || this.fuelGallons <= 0 || this.totalMass() > this.params.maxMass) {
+      this.controls.throttle = 0;
+    }
+
     const aero = computeAero(
       this.params,
       this.vel,
@@ -312,12 +347,16 @@ export class Plane {
     );
     this.lastAero = aero;
 
-    // Fuel burn (gph → gal/sec). Engine quits when dry.
-    const gph = this.idleGph + this.controls.throttle * (this.fullGph - this.idleGph);
-    this.fuelGallons -= gph / 3600 * dt;
+    // Fuel burn (gph → gal/sec). Engine quits when dry and stays dead until
+    // refueling — engineDead is what main.ts checks to mute the throttle.
+    if (!this.engineDead) {
+      const gph = this.idleGph + this.controls.throttle * (this.fullGph - this.idleGph);
+      this.fuelGallons -= gph / 3600 * dt;
+    }
     if (this.fuelGallons <= 0) {
       this.fuelGallons = 0;
-      this.controls.throttle = 0;       // engine starves
+      this.engineDead = true;
+      this.controls.throttle = 0;
     }
 
     // Use TOTAL mass for force integration so fuel + cargo affect performance.
@@ -338,6 +377,7 @@ export class Plane {
     this.wasStalled = aero.stalled;
 
     let touched = 0;
+    let touchedWater = 0;
     let maxImpact = 0;
     let gearIdx = 0;
     this.gearCompression = [0, 0, 0];
@@ -349,20 +389,41 @@ export class Plane {
     const iceSlipBonus = this.params.iceSlipBonus ?? 1;
     const brakeFrictionMul = icy ? Math.min(1, 0.25 * iceBrakeBonus) : 1.0;
     const slipFrictionMul = icy ? Math.min(1, 0.4 * iceSlipBonus) : 1.0;
+    const hasFloats = this.params.hasFloats === true;
     for (const g of this.gear) {
       _world.copy(g.pos).applyQuaternion(this.quat).add(this.pos);
-      const groundY = surfaceTopY(Math.floor(_world.x), Math.floor(_world.z));
+      const px = Math.floor(_world.x);
+      const pz = Math.floor(_world.z);
+      const terrainTop = surfaceTopY(px, pz);
+      // Float planes: water VISIBLE SURFACE acts as the gear floor.
+      // WATER_SURFACE_Y = SEA_LEVEL + VOXEL_SIZE = 30, the top face of the
+      // highest water voxel. Earlier code used SEA_LEVEL=28 directly, which
+      // put the equilibrium 2 m below the actual water mesh — visually the
+      // plane was submerged.
+      let groundY = terrainTop;
+      let onWater = false;
+      if (hasFloats && terrainTop <= SEA_LEVEL) {
+        groundY = WATER_SURFACE_Y;
+        onWater = true;
+      }
       const compression = (groundY + g.restLength) - _world.y;
       if (compression > 0) {
         touched++;
+        if (onWater) touchedWater++;
         this.gearCompression[gearIdx] = Math.min(compression, g.restLength);
         _wWorld.copy(this.angVel).applyQuaternion(this.quat);
         _rWorld.copy(_world).sub(this.pos);
         _vPoint.copy(_wWorld).cross(_rWorld).add(this.vel);
         const vY = _vPoint.y;
         if (-vY > maxImpact) maxImpact = -vY;
-        const fSpring = g.springK * compression;
-        const fDamp = -g.damping * vY;
+        const springK = onWater ? g.springK * 1.2 : g.springK;
+        const damping = onWater ? g.damping * 2.0 : g.damping;
+        // Cap spring compression so a deep-underwater spawn doesn't generate
+        // millions of newtons. The buoyancy backstop handles the bulk of
+        // the lift below sea level — the spring just cushions normal touchdown.
+        const cappedCompression = Math.min(compression, g.restLength * 1.5);
+        const fSpring = springK * cappedCompression;
+        const fDamp = -damping * vY;
         const fUp = Math.max(0, fSpring + fDamp);
         _force.y += fUp;
         _horizV.set(_vPoint.x, 0, _vPoint.z);
@@ -373,17 +434,41 @@ export class Plane {
         const vForward = _horizV.dot(_fwd);
         const vSide = _horizV.dot(_right);
         _fricForce.set(0, 0, 0);
-        // Brake amplifier — was 40× (gives effective µ~1.4, way over real-world).
-        // 12× yields µ~0.42 at full brake on dry asphalt, which is realistic.
-        const brakeMul = g.braked ? 1 + this.controls.brake * 12 * brakeFrictionMul : 1;
-        const effectiveRoll = g.rollFriction * brakeMul;
-        if (Math.abs(vForward) > 0.01) {
-          const mag = Math.min(effectiveRoll * fUp, mass * 8);
-          _fricForce.addScaledVector(_fwd, -Math.sign(vForward) * mag);
-        }
-        if (Math.abs(vSide) > 0.01) {
-          const mag = Math.min(g.slipFriction * fUp * slipFrictionMul, mass * 4);
-          _fricForce.addScaledVector(_right, -Math.sign(vSide) * mag);
+        if (onWater) {
+          // Water drag, per gear contact. Tuned so a Cub on floats can plane
+          // up and reach takeoff speed at full throttle. Real Cub on water:
+          // 25 kt (13 m/s) on step, 40 kt (20 m/s) liftoff.
+          //
+          // Below step (plowing): ~quadratic, peak hump drag ~25 % of weight
+          //   so the plane has to "push through" the hump but full thrust
+          //   wins. Above step (planing): much lower coefficient, so the
+          //   plane accelerates freely toward takeoff speed.
+          const stepSpeed = 13;
+          const speed = Math.hypot(vForward, vSide);
+          const dragCoef = speed < stepSpeed
+            ? 0.10 * mass * (1 - speed / stepSpeed * 0.5)
+            : 0.022 * mass;
+          if (Math.abs(vForward) > 0.01) {
+            _fricForce.addScaledVector(_fwd, -Math.sign(vForward) * dragCoef * Math.abs(vForward));
+          }
+          // Lateral water drag — pontoons resist sideslip but not so hard
+          // that you can't yaw the plane around with rudder.
+          if (Math.abs(vSide) > 0.01) {
+            _fricForce.addScaledVector(_right, -Math.sign(vSide) * mass * 1.2 * Math.abs(vSide));
+          }
+        } else {
+          // Land: rolling/brake friction (existing behavior).
+          // Brake amplifier — 12× gives µ~0.42 at full brake on dry asphalt.
+          const brakeMul = g.braked ? 1 + this.controls.brake * 12 * brakeFrictionMul : 1;
+          const effectiveRoll = g.rollFriction * brakeMul;
+          if (Math.abs(vForward) > 0.01) {
+            const mag = Math.min(effectiveRoll * fUp, mass * 8);
+            _fricForce.addScaledVector(_fwd, -Math.sign(vForward) * mag);
+          }
+          if (Math.abs(vSide) > 0.01) {
+            const mag = Math.min(g.slipFriction * fUp * slipFrictionMul, mass * 4);
+            _fricForce.addScaledVector(_right, -Math.sign(vSide) * mag);
+          }
         }
         _force.add(_fricForce);
 
@@ -394,14 +479,45 @@ export class Plane {
         // hard braking (so braking actually pitches the nose down for taildraggers).
         // Tricycle planes use a much weaker coupling — the nose wheel constrains
         // the front, real tricycles barely pitch under brakes.
-        const brakeCouple = this.tricycle ? 0.18 : 0.80;
+        // On water, suppress brake coupling — there's nothing to brake against.
+        const brakeCouple = onWater ? 0 : (this.tricycle ? 0.18 : 0.80);
         const couple = 0.05 + this.controls.brake * brakeCouple;
         _totalTorqueBody.addScaledVector(_torqueBody, couple);
       }
       gearIdx++;
     }
     this.onGround = touched > 0;
+    this.onWater = touchedWater > 0;
     this.lastImpactSpeed = maxImpact;
+
+    // Float plane buoyancy backstop — the gear spring catches MOST water
+    // contacts, but a fast or steep dive can punch the plane through before
+    // the spring builds up. Add a strong upward force whenever the plane's
+    // CG is at-or-below sea level over water. Sufficient to cap descent
+    // rate immediately and float the plane back to surface.
+    if (hasFloats) {
+      const groundCenter = surfaceTopY(Math.floor(this.pos.x), Math.floor(this.pos.z));
+      if (groundCenter <= SEA_LEVEL && this.pos.y < WATER_SURFACE_Y + 0.5) {
+        const rawSub = Math.max(0, WATER_SURFACE_Y + 0.5 - this.pos.y);
+        const submersion = Math.min(1.0, rawSub);
+        const buoyancyForce = mass * 14 * submersion;
+        const dampForce = -this.vel.y * mass * 3;
+        _force.y += Math.max(0, buoyancyForce + dampForce);
+        this.onWater = true;
+        this.onGround = true;
+      }
+    }
+    // HARD WATER FLOOR: float plane CANNOT pass below the visible waterline.
+    const FLOAT_WATERLINE = WATER_SURFACE_Y - 0.2;
+    if (hasFloats) {
+      const gc = surfaceTopY(Math.floor(this.pos.x), Math.floor(this.pos.z));
+      if (gc <= SEA_LEVEL && this.pos.y < FLOAT_WATERLINE) {
+        this.pos.y = FLOAT_WATERLINE;
+        if (this.vel.y < 0) this.vel.y = 0;
+        this.onWater = true;
+        this.onGround = true;
+      }
+    }
 
     // Tailwheel steering: when on the ground, rudder input gives a direct
     // yaw torque so you can taxi at zero airspeed. Fades out as you accelerate
@@ -415,29 +531,49 @@ export class Plane {
     }
 
     // CRASH DETECTION
-    // (a) Hard impact via gear (descent rate at touchdown over threshold)
-    if (touched > 0 && maxImpact > 6.5) {
+    // (a) Hard impact via gear (descent rate at touchdown over threshold).
+    // Water absorbs much more energy than packed dirt — a real float plane
+    // can splash down at 10–15 m/s without damage, so the threshold is
+    // lifted significantly when the contact is on water.
+    const hardLandingThreshold = touchedWater > 0 ? 15.0 : 6.5;
+    if (touched > 0 && maxImpact > hardLandingThreshold) {
       this.crashed = true;
       this.crashCause = `Hard landing — ${maxImpact.toFixed(1)} m/s descent`;
     }
     // (b) Non-gear part hits ground / water (wingtip strike, nose into
     // terrain, dipped into water, etc.). For frozen-ocean tiles surfaceTopY
     // already returns the top of the ICE_PACK voxel — landing on ice works
-    // through the normal gear path.
+    // through the normal gear path. Float planes don't crash on water — the
+    // pontoons handle it (their gear path catches the plane buoyantly).
     if (!this.crashed) {
       for (const probe of CRASH_PROBES) {
-        _world.copy(probe).applyQuaternion(this.quat).add(this.pos);
+        _world.copy(probe.p).applyQuaternion(this.quat).add(this.pos);
         const px = Math.floor(_world.x);
         const pz = Math.floor(_world.z);
         const groundY = surfaceTopY(px, pz);
-        // Over open (non-frozen) water: water surface = hard floor.
-        const floor = groundY <= SEA_LEVEL ? SEA_LEVEL : groundY;
-        const cause = groundY <= SEA_LEVEL ? 'Water strike' : 'Terrain strike';
+        const overWater = groundY <= SEA_LEVEL;
+        // Float planes skip non-wingtip water probes (pontoons handle nose/
+        // tail/inboard). Wingtips DO fire a water strike — banking far
+        // enough to dip a wing into the water is a crash.
+        if (overWater && hasFloats && !probe.wingtip) continue;
+        const floor = overWater ? WATER_SURFACE_Y : groundY;
+        const cause = overWater ? 'Water strike' : 'Terrain strike';
         if (_world.y < floor) {
           this.crashed = true;
           this.crashCause = cause;
           break;
         }
+      }
+    }
+    // (b2) Non-float planes: also crash if the plane's CG drops below sea
+    // level over water. The probe check above catches it via the nose probe,
+    // but the CG check is a belt-and-braces backup so the plane never just
+    // sinks visually through the surface without firing the crash.
+    if (!this.crashed && !hasFloats) {
+      const groundCenter = surfaceTopY(Math.floor(this.pos.x), Math.floor(this.pos.z));
+      if (groundCenter <= SEA_LEVEL && this.pos.y < WATER_SURFACE_Y) {
+        this.crashed = true;
+        this.crashCause = 'Water strike';
       }
     }
     // (c) Antenna / wire strike — city infrastructure hazards.
@@ -479,6 +615,15 @@ export class Plane {
       this.vel.multiplyScalar(0);
       this.angVel.multiplyScalar(0);
       this.passengerComfort = Math.max(0, this.passengerComfort - 100);   // crash = no comfort
+      // Water crashes: pin the wreck visually at-or-just-above water surface
+      // so the player actually SEES the splashed plane instead of it sinking
+      // straight through the surface to the seabed below.
+      if (this.crashCause === 'Water strike') {
+        const gc = surfaceTopY(Math.floor(this.pos.x), Math.floor(this.pos.z));
+        if (gc <= SEA_LEVEL && this.pos.y < WATER_SURFACE_Y) {
+          this.pos.y = WATER_SURFACE_Y + 0.2;
+        }
+      }
       return;
     }
 

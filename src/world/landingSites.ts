@@ -29,6 +29,9 @@ export interface LandingSite {
   heading: number;       // strip orientation in degrees (0 = N-S, 90 = E-W)
   theme: LandingTheme;   // terrain shape around the strip
   difficulty: Difficulty;
+  // True for water-only seaplane bases. No flat sand island; cargo zone sits
+  // on a floating dock. Only float-equipped planes can do missions here.
+  isSeaplaneBase?: boolean;
 }
 
 // 14 hand-placed sites distributed across the world for variety. Strips snap
@@ -59,6 +62,13 @@ export const LANDING_SITES: LandingSite[] = [
   // Atoll: middle of the eastern archipelago. Sandy strip on the main island
   // surrounded by ocean — over-water approach with no diversion options.
   { name: 'Atoll',         cx:  7500, cz: -1500, elev: 36, surface: 'sand',   length: 130, width: 14, heading: 0, theme: 'flat',   difficulty: 'hard'       },
+  // === Sea plane bases — water-only, dock-based. Require floats. ===
+  // Eagle Cove — NE forest coast lake.
+  { name: 'Eagle Cove',    cx:  2200, cz:  2400, elev: 28, surface: 'sand',   length: 200, width: 20, heading: 0, theme: 'water',  difficulty: 'medium',     isSeaplaneBase: true },
+  // Tropic Bay — open water in the eastern archipelago, between islands.
+  { name: 'Tropic Bay',    cx:  6800, cz:  -200, elev: 28, surface: 'sand',   length: 220, width: 20, heading: 0, theme: 'water',  difficulty: 'medium',     isSeaplaneBase: true },
+  // Marina Point — far west coastal lake.
+  { name: 'Marina Point',  cx: -3500, cz:  -800, elev: 28, surface: 'sand',   length: 200, width: 20, heading: 0, theme: 'water',  difficulty: 'hard',       isSeaplaneBase: true },
 ];
 
 
@@ -85,6 +95,19 @@ export function landingSiteThemeDelta(x: number, z: number): number {
       const tLong = 1 - Math.abs(dz) / channelLongZ;
       const wLong = tLong * tLong * (3 - 2 * tLong);
       total += -36 * wLat * wLong;
+      continue;
+    }
+
+    // Seaplane bases need a deep, guaranteed water bowl regardless of the
+    // surrounding biome (forest hills can sit 60+ m above sea level). Carve
+    // hard so the area always falls below SEA_LEVEL=28 and water fills in.
+    if (s.isSeaplaneBase) {
+      const r = 600;
+      const dist0 = Math.hypot(dx, dz);
+      if (dist0 > r) continue;
+      const w0 = 1 - dist0 / r;
+      const ws0 = w0 * w0 * w0 * (w0 * (w0 * 6 - 15) + 10);
+      total += -120 * ws0;
       continue;
     }
 
@@ -190,6 +213,9 @@ export const TIGHT_WATER_SITES = new Set(['Riverbar']);
 
 export function landingSiteSampleAt(x: number, z: number): LandingSiteSample | null {
   for (const s of LANDING_SITES) {
+    // Seaplane bases have no flat island — they're open water. Skip the
+    // strip/falloff overlay so the water-theme bowl fills naturally.
+    if (s.isSeaplaneBase) continue;
     const dx = x - s.cx;
     const dz = z - s.cz;
     const halfW = s.width / 2;

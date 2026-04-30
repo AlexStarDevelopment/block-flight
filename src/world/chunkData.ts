@@ -470,18 +470,29 @@ const SHADE_PLUS_Y = 1.0;
 const SHADE_MINUS_Y = 0.55;
 const SHADE_PLUS_Z = 0.88;
 
+// Cheap deterministic 2D hash: returns -1..1 based on world voxel coords.
+// Used to add per-vertex color variance to water without a noise import.
+function vertexHash(vx: number, vz: number): number {
+  let h = (vx | 0) * 374761393 + (vz | 0) * 668265263;
+  h = (h ^ (h >>> 13)) * 1274126177;
+  h = h ^ (h >>> 16);
+  return ((h & 0xffff) / 0x7fff) - 1;
+}
+
 function pushQuad(
   positions: number[], normals: number[], colors: number[], indices: number[],
   axis: number, dirSign: number,
   i: number, j: number, k: number,
   w: number, h: number,
   blockId: number, shade: number,
+  worldOriginX: number, worldOriginZ: number,
 ) {
   const color = BLOCK_COLOR[blockId] ?? [1, 1, 1];
   const r = color[0] * shade;
   const g = color[1] * shade;
   const b = color[2] * shade;
   const slice = dirSign > 0 ? k + 1 : k;
+  const isWater = blockId === BLOCK.WATER || blockId === BLOCK.TROPICAL_LAGOON;
 
   let v0: [number, number, number];
   let v1: [number, number, number];
@@ -525,7 +536,46 @@ function pushQuad(
     // Scale voxel-unit positions to world meters at write time.
     positions.push(v[0] * VOXEL_SIZE, v[1] * VOXEL_SIZE, v[2] * VOXEL_SIZE);
     normals.push(nx, ny, nz);
-    colors.push(r, g, b);
+    if (isWater) {
+      // World-space coords (in METERS) for noise/wave sampling.
+      const wx = worldOriginX + v[0] * VOXEL_SIZE;
+      const wz = worldOriginZ + v[2] * VOXEL_SIZE;
+      let tintR = 1, tintG = 1, tintB = 1;
+      if (ny > 0) {
+        // TOP water faces — visible from above, this is what the player sees
+        // most. Combine multiple wave scales so distant water shows broad
+        // patterns and close water shows fine ripple — gives strong depth
+        // and proximity cues.
+        const swell = Math.sin(wx * 0.045 + wz * 0.025);                 // ~140 m
+        const wave  = Math.sin(wx * 0.13  - wz * 0.18);                  // ~40 m
+        const ripple = Math.sin(wx * 0.42 + wz * 0.31);                  // ~15 m
+        const sparkle = vertexHash(wx, wz);                              // per-2m
+        const lit = 0.45 * swell + 0.30 * wave + 0.18 * ripple + 0.18 * sparkle;
+        // Strong blue/green modulation (lit waves are lighter, troughs darker)
+        // and a touch of foam-white at the brightest crests for a sense of
+        // motion and texture.
+        const foam = Math.max(0, lit - 0.55) * 1.3;
+        tintR = 1 + lit * 0.20 + foam * 0.45;
+        tintG = 1 + lit * 0.30 + foam * 0.50;
+        tintB = 1 + lit * 0.36 + foam * 0.40;
+      } else {
+        // SIDE water faces (river banks, sea-base carve walls). Subtle
+        // depth banding so submerged walls don't read as flat blocks.
+        const wy = v[1] * VOXEL_SIZE;
+        const band = Math.sin(wy * 0.6);
+        const bn = vertexHash(wx + 511, wz + 919) * 0.5;
+        tintR = 1 + (band * 0.05 + bn * 0.04);
+        tintG = 1 + (band * 0.08 + bn * 0.04);
+        tintB = 1 + (band * 0.12 + bn * 0.06);
+      }
+      colors.push(
+        Math.max(0, Math.min(1.2, r * tintR)),
+        Math.max(0, Math.min(1.2, g * tintG)),
+        Math.max(0, Math.min(1.2, b * tintB)),
+      );
+    } else {
+      colors.push(r, g, b);
+    }
   }
   indices.push(start, start + 1, start + 2, start, start + 2, start + 3);
 }
@@ -549,6 +599,8 @@ export function buildMeshArrays(chunk: ChunkData): MeshArrays {
   const indices: number[] = [];
 
   const dimsXYZ = [CHUNK_SIZE, CHUNK_HEIGHT, CHUNK_SIZE];
+  const worldOriginX = chunk.cx * CHUNK_SIZE * VOXEL_SIZE;
+  const worldOriginZ = chunk.cz * CHUNK_SIZE * VOXEL_SIZE;
 
   for (let axis = 0; axis < 3; axis++) {
     const u = (axis + 1) % 3;
@@ -588,16 +640,25 @@ export function buildMeshArrays(chunk: ChunkData): MeshArrays {
           while (i < W) {
             const c = mask[j * W + i];
             if (c === 0) { i++; continue; }
+            // Skip greedy merging for water — we want per-voxel quads so
+            // each face has its own vertex colors and the wave/ripple
+            // pattern is actually visible. Without this, the mesher merges
+            // all flat water into one giant quad with only 4 vertex samples.
+            const isWater = c === BLOCK.WATER || c === BLOCK.TROPICAL_LAGOON;
             let w = 1;
-            while (i + w < W && mask[j * W + i + w] === c) w++;
-            let h = 1;
-            outer: while (j + h < H) {
-              for (let ii = 0; ii < w; ii++) {
-                if (mask[(j + h) * W + i + ii] !== c) break outer;
-              }
-              h++;
+            if (!isWater) {
+              while (i + w < W && mask[j * W + i + w] === c) w++;
             }
-            pushQuad(positions, normals, colors, indices, axis, dirSign, i, j, k, w, h, c, shade);
+            let h = 1;
+            if (!isWater) {
+              outer: while (j + h < H) {
+                for (let ii = 0; ii < w; ii++) {
+                  if (mask[(j + h) * W + i + ii] !== c) break outer;
+                }
+                h++;
+              }
+            }
+            pushQuad(positions, normals, colors, indices, axis, dirSign, i, j, k, w, h, c, shade, worldOriginX, worldOriginZ);
             for (let jj = 0; jj < h; jj++) {
               for (let ii = 0; ii < w; ii++) {
                 mask[(j + jj) * W + i + ii] = 0;

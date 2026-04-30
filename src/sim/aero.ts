@@ -33,6 +33,19 @@ export interface AircraftParams {
   // input creates opposite-direction yaw torque scaled by airspeed. STOL
   // planes get the strongest values; turbines / sleeker planes less.
   adverseYawCoef?: number;      // N·m per (roll-input × q × wingArea), default 0.06
+  // Static longitudinal stability — restoring pitch torque per radian of AoA
+  // deviation from the airframe's natural AoA. Higher = stiffer / faster
+  // return to trimmed attitude. Real-plane match: 1.5.
+  pitchStabilityCoef?: number;
+  // The airframe's "neutral" AoA — the equilibrium AoA at trim=0 and zero
+  // stick. Set by wing/tail incidence in real planes; we use ~4° so the
+  // plane carries weight at cruise speed without pilot input. ("Planes
+  // want to fly".)
+  alphaNeutral?: number;
+  // Elevator authority — produces a pitch moment proportional to q × S × this.
+  // Replaces the older "pitchRate × ctrlScale" model so equilibrium AoA is
+  // independent of airspeed (the way real elevator/trim systems behave).
+  elevatorAuthCoef?: number;
   // Optional ground-handling modifiers from upgrades (alpine tires, skis).
   iceBrakeBonus?: number;       // multiplier on ice brake friction (default 1)
   iceSlipBonus?: number;        // multiplier on ice cornering friction (default 1)
@@ -43,6 +56,11 @@ export interface AircraftParams {
   // Bigger planes need wider wheelbase + lower mains so the prop has clearance.
   gearMainX?: number; gearMainY?: number; gearMainZ?: number;
   gearThirdY?: number; gearThirdZ?: number;
+  // Float plane mode — when true, the plane has amphibious pontoons. Water
+  // surface acts as a soft landing surface (no Water-strike crash); water
+  // contact drag scales with speed (high below step speed, low above).
+  // Wheels still work for amphibious land ops.
+  hasFloats?: boolean;
 }
 
 export const SUPER_CUB: AircraftParams = {
@@ -174,17 +192,23 @@ export function computeAero(
 
   const cdInduced = (cl * cl) / (Math.PI * p.aspectRatio * p.e) * groundEffect;
   const cdFlap = flap * p.flapCdPerStage;
-  const cd = p.cd0 + cdInduced + cdFlap;
+  // Float plane parasite-drag penalty: pontoons + struts add roughly 50 %
+  // to baseline parasite drag and reduce vMax ~10 %, matching real PA-18 /
+  // Beaver float-vs-wheel performance differences.
+  const floatCd = p.hasFloats ? p.cd0 * 0.5 : 0;
+  const cd = p.cd0 + cdInduced + cdFlap + floatCd;
 
   const liftN = q * p.wingArea * cl * liftBoost;
   const dragN = q * p.wingArea * cd;
 
   // Thrust scaled by density altitude. Falls off with airspeed.
+  // Floats also reduce effective vMax by ~10 % from added drag.
+  const effectiveVmax = p.hasFloats ? p.vMax * 0.90 : p.vMax;
   const thrustN =
     controls.throttle *
     p.maxThrust *
     (rho / RHO_SL) *
-    Math.max(0, 1 - u / p.vMax);
+    Math.max(0, 1 - u / effectiveVmax);
   _thrustBody.set(0, 0, thrustN);
 
   if (airspeed > 0.01) {
@@ -207,12 +231,20 @@ export function computeAero(
   const ySideForce = -v * Math.abs(v) * rho * p.wingArea * 0.7;
   _forceBody.x += ySideForce;
 
-  // Aero stability torques (weathercock + dihedral) require real airflow over
-  // the surfaces. Fade them in over the typical taxi → takeoff range so light
-  // wind doesn't yank a slow-rolling plane around.
+  // Aero stability torques (weathercock + dihedral + pitch) require real
+  // airflow over the surfaces. Fade them in over the typical taxi → takeoff
+  // range so light wind doesn't yank a slow-rolling plane around.
   const aeroAuth = Math.min(1, Math.max(0, (airspeed - 5) / 12));
   const weatherCock = beta * 0.5 * q * p.wingArea * aeroAuth;
   const dihedralRoll = beta * 0.10 * q * p.wingArea * aeroAuth;
+  // STATIC LONGITUDINAL STABILITY: real airframes (Cub, 172) have a built-in
+  // "natural" AoA from wing/tail incidence. The horizontal stabilizer creates
+  // a restoring moment toward this AoA — that's what makes "planes want to
+  // fly". At trim=0 the equilibrium AoA equals alphaNeutral (~4°), giving
+  // enough lift for level cruise without pilot input.
+  const alphaNeutral = p.alphaNeutral ?? 0.07;     // ~4° natural AoA
+  const alphaErr = alpha - alphaNeutral;
+  const pitchStability = alphaErr * (p.pitchStabilityCoef ?? 1.5) * q * p.wingArea * aeroAuth;
 
   _qBody.copy(orientation);
   const forceWorld = _forceBody.clone().applyQuaternion(_qBody);
@@ -255,10 +287,21 @@ export function computeAero(
       0.3
     : 0;
 
-  // Effective pitch input = stick + trim. Trim shifts the equilibrium; the
-  // stick keeps usable authority past it (clamped to [-1.3, 1.3] so a fully
-  // nose-up trimmed plane can still be pushed nose-down by the stick).
-  const pitchInput = THREE.MathUtils.clamp(controls.pitch + controls.trim, -1.3, 1.3);
+  // Effective pitch input = stick + trim×0.35. Trim authority is intentionally
+  // less than full stick (real Cub trim wheel is ~30-40% of full elevator)
+  // so a fully-trimmed plane can still be overridden with stick.
+  const pitchInput = THREE.MathUtils.clamp(controls.pitch + controls.trim * 0.35, -1.3, 1.3);
+
+  // Elevator moment — proportional to dynamic pressure (q) like a real
+  // elevator. Below taxi speed the prop wash gives a baseline so taxi
+  // and slow-flight pitch control still work. Both elevator AND stability
+  // scale the same way (∝ q × S), so equilibrium AoA depends only on the
+  // ratio of elevatorAuth to stabilityCoef — independent of airspeed.
+  // This is what gives "trim sets airspeed" behavior.
+  const propWashQ = 0.5 * rho * propWash * propWash;
+  const tailQ = Math.max(q, propWashQ);
+  const elevatorAuth = p.elevatorAuthCoef ?? 0.32;
+  const elevatorMoment = -pitchInput * elevatorAuth * tailQ * p.wingArea;
 
   // Adverse yaw — roll input creates opposite-direction yaw torque scaled by
   // airspeed (the down-going aileron has more drag than the up-going one).
@@ -269,8 +312,9 @@ export function computeAero(
   const adverseYaw = -controls.roll * adverseYawCoef * q * p.wingArea * aeroAuth * adverseYawAoaBoost;
 
   const torqueBody = new THREE.Vector3(
-    -pitchInput * p.pitchRate * ctrlScale -
+    elevatorMoment -
       angVelBody.x * p.pitchDamp +
+      pitchStability +
       powerOnPitchUp +
       buffetPitch,
     controls.yaw * p.yawRate * ctrlScale -

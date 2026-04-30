@@ -33,6 +33,9 @@ export interface PlaneVisual {
   group: THREE.Group;
   update(inputs: PlaneVisualInputs): void;
   setColors(c: { primary: number; secondary: number; surface: number; accent: number }): void;
+  // Toggle amphibious pontoons under the plane (only visible when the
+  // 'floats' upgrade is owned).
+  setFloats(b: boolean): void;
 }
 
 const FLAP_PER_STAGE_RAD = (12 * Math.PI) / 180;
@@ -544,6 +547,164 @@ function buildVisual(spec: PlaneSilhouette): PlaneVisual {
     : makeTailGear(spec.thirdGearY, spec.thirdGearZ, matAccent, matWheel);
   root.add(thirdGear);
 
+  // ===== Amphibious pontoons (hidden until floats upgrade is owned) =====
+  // Real Cub/Beaver-style float setup: pontoons LONGER than the fuselage,
+  // sitting clearly BELOW the body with visible vertical + cross struts in
+  // a "X" pattern (Edo-style). When the floats physics is enabled, the gear
+  // contact drops 0.6 m and stance widens 0.3 m — pontoons sit at that new
+  // gear contact level, with a clean visible gap to the fuselage.
+  const matPontoon = new THREE.MeshLambertMaterial({ color: 0xb0b0b8 });
+  const matPontoonStripe = new THREE.MeshLambertMaterial({ color: 0xc23a2a });
+  const matWaterRudder = new THREE.MeshLambertMaterial({ color: 0x4a3b30 });
+  const floatsGroup = new THREE.Group();
+  const pontoonLength = spec.fuse.l * 1.05;        // longer than fuselage
+  const pontoonHalfW = 0.36;
+  const pontoonHeight = 0.55;
+  // Pontoon BOTTOM aligned with the floats-mode gear contact (mainGearY-0.6).
+  // Body extends pontoonHeight upward from there, so the pontoon top sits
+  // ~0.5 m below the fuselage bottom — clean gap for visible struts.
+  const floatsGearDrop = 0.6;
+  const pontoonBottom = spec.mainGearY - floatsGearDrop;
+  const pontoonY = pontoonBottom + pontoonHeight / 2;
+  const pontoonTop = pontoonBottom + pontoonHeight;
+  const fuseBottom = -spec.fuse.h * 0.5;
+  const pontoonZ = spec.fuse.z;
+  const pontoonOffsetX = spec.mainGearX + 0.3;     // wider stance with floats
+  for (const sx of [-1, 1]) {
+    // Main pontoon body — twin-step planing hull. Forward portion (60% of
+    // length) is the planing surface, then a step, then a shorter aft.
+    const forwardLen = pontoonLength * 0.62;
+    const aftLen = pontoonLength * 0.34;
+    const stepDepth = 0.08;     // visible notch at the step
+    const forward = new THREE.Mesh(
+      new THREE.BoxGeometry(pontoonHalfW * 2, pontoonHeight, forwardLen),
+      matPontoon,
+    );
+    forward.position.set(
+      sx * pontoonOffsetX,
+      pontoonY,
+      pontoonZ + pontoonLength / 2 - forwardLen / 2,
+    );
+    floatsGroup.add(forward);
+    const aft = new THREE.Mesh(
+      new THREE.BoxGeometry(pontoonHalfW * 2, pontoonHeight - stepDepth, aftLen),
+      matPontoon,
+    );
+    aft.position.set(
+      sx * pontoonOffsetX,
+      pontoonY + stepDepth / 2,
+      pontoonZ - pontoonLength / 2 + aftLen / 2,
+    );
+    floatsGroup.add(aft);
+
+    // Tapered front bow (rises forward + up) and rear deck taper.
+    const bow = new THREE.Mesh(
+      new THREE.BoxGeometry(pontoonHalfW * 1.5, pontoonHeight * 0.7, 0.7),
+      matPontoon,
+    );
+    bow.position.set(
+      sx * pontoonOffsetX,
+      pontoonY + 0.12,
+      pontoonZ + pontoonLength / 2 + 0.35,
+    );
+    floatsGroup.add(bow);
+    const stern = new THREE.Mesh(
+      new THREE.BoxGeometry(pontoonHalfW * 1.5, pontoonHeight * 0.55, 0.4),
+      matPontoon,
+    );
+    stern.position.set(
+      sx * pontoonOffsetX,
+      pontoonY + 0.10,
+      pontoonZ - pontoonLength / 2 - 0.2,
+    );
+    floatsGroup.add(stern);
+
+    // Water rudder hanging off the back of each pontoon.
+    const rudder = new THREE.Mesh(
+      new THREE.BoxGeometry(0.06, 0.55, 0.5),
+      matWaterRudder,
+    );
+    rudder.position.set(
+      sx * pontoonOffsetX,
+      pontoonBottom + 0.1,
+      pontoonZ - pontoonLength / 2 - 0.45,
+    );
+    floatsGroup.add(rudder);
+
+    // Red trim stripe along the pontoon side.
+    const stripe = new THREE.Mesh(
+      new THREE.BoxGeometry(0.06, 0.10, pontoonLength + 0.4),
+      matPontoonStripe,
+    );
+    stripe.position.set(
+      sx * (pontoonOffsetX + pontoonHalfW * 0.95),
+      pontoonY + 0.20,
+      pontoonZ,
+    );
+    floatsGroup.add(stripe);
+
+    // Bow cleat for tying up at the dock.
+    const cleat = new THREE.Mesh(
+      new THREE.BoxGeometry(0.20, 0.12, 0.20),
+      matAccent,
+    );
+    cleat.position.set(
+      sx * pontoonOffsetX,
+      pontoonTop + 0.06,
+      pontoonZ + pontoonLength / 2 - 0.4,
+    );
+    floatsGroup.add(cleat);
+
+    // Two vertical struts (front + rear) from pontoon top to fuselage bottom.
+    const strutH = fuseBottom - pontoonTop;
+    if (strutH > 0.05) {
+      for (const sz of [-pontoonLength * 0.18, pontoonLength * 0.22]) {
+        const strut = new THREE.Mesh(
+          new THREE.BoxGeometry(0.10, strutH, 0.10),
+          matAccent,
+        );
+        strut.position.set(
+          sx * pontoonOffsetX,
+          pontoonTop + strutH / 2,
+          pontoonZ + sz,
+        );
+        floatsGroup.add(strut);
+      }
+    }
+  }
+
+  // X-pattern cross-bracing between the two pontoons (Edo float look). One
+  // bar leans from left-front to right-rear, the other from right-front to
+  // left-rear, meeting near the fuselage bottom.
+  {
+    const xZ1 = -pontoonLength * 0.18;
+    const xZ2 = +pontoonLength * 0.22;
+    const xY = (pontoonTop + fuseBottom) / 2;
+    const xLen = Math.hypot(pontoonOffsetX * 2, xZ2 - xZ1);
+    const angle = Math.atan2(xZ2 - xZ1, pontoonOffsetX * 2);
+    for (const sign of [-1, 1]) {
+      const bar = new THREE.Mesh(
+        new THREE.BoxGeometry(xLen, 0.08, 0.08),
+        matAccent,
+      );
+      bar.position.set(0, xY, (xZ1 + xZ2) / 2);
+      bar.rotation.y = sign * angle;
+      floatsGroup.add(bar);
+    }
+    // Plus a horizontal cross at the front and rear pontoon-top level.
+    for (const cz of [xZ1, xZ2]) {
+      const cross = new THREE.Mesh(
+        new THREE.BoxGeometry(pontoonOffsetX * 2, 0.08, 0.08),
+        matAccent,
+      );
+      cross.position.set(0, pontoonTop + 0.10, pontoonZ + cz);
+      floatsGroup.add(cross);
+    }
+  }
+
+  floatsGroup.visible = false;
+  root.add(floatsGroup);
+
   return {
     group: root,
     setColors(c) {
@@ -551,6 +712,9 @@ function buildVisual(spec: PlaneSilhouette): PlaneVisual {
       matWing.color.setHex(c.secondary);
       matSurface.color.setHex(c.surface);
       matAccent.color.setHex(c.accent);
+    },
+    setFloats(b) {
+      floatsGroup.visible = b;
     },
     update(inp) {
       const flapAngle = Math.min(inp.flapStage, 3) * FLAP_PER_STAGE_RAD;

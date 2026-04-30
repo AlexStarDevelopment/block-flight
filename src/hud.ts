@@ -86,8 +86,14 @@ export function renderHUD(
   const brakePct = Math.round(plane.controls.brake * 100);
   const brakeTxt = brakePct > 0 ? `  BRK ${brakePct}%` : '';
   const fuelPct = Math.round((plane.fuelGallons / plane.fuelMaxGallons) * 100);
-  const fuelLow = fuelPct < 25 ? ' !' : '';
+  const fuelLow = plane.engineDead
+    ? '   <ENGINE OUT — refuel at apron>'
+    : fuelPct < 25 ? ' !' : '';
   const massKg = plane.totalMass();
+  const overMtow = massKg > plane.params.maxMass;
+  const overTxt = overMtow
+    ? `  <OVER MTOW ${(massKg - plane.params.maxMass).toFixed(0)} kg — engine inhibited>`
+    : '';
   const cargoTxt = plane.cargoKg > 0 ? `  CARGO ${plane.cargoKg.toFixed(0)} kg` : '';
   // Show comfort only when actively carrying passengers — keep HUD clean otherwise.
   const comfortTxt = plane.cargoKg > 0 && plane.passengerComfort < 100 - 0.001
@@ -107,7 +113,7 @@ export function renderHUD(
     `OAT ${oatC.toFixed(0)}°C\n` +
     `VSI  ${vsi >= 0 ? '+' : ''}${vsi.toFixed(0).padStart(4)} fpm   HDG ${String(hdg).padStart(3, '0')}°\n` +
     `THR  ${thr}%   FLAP ${flap}/3   TRIM ${trimMark}${brakeTxt}${stallTxt}${ge}${ground}\n` +
-    `FUEL ${plane.fuelGallons.toFixed(1)}/${plane.fuelMaxGallons} gal (${fuelPct}%)${fuelLow}   MASS ${massKg.toFixed(0)} kg${cargoTxt}${comfortTxt}\n` +
+    `FUEL ${plane.fuelGallons.toFixed(1)}/${plane.fuelMaxGallons} gal (${fuelPct}%)${fuelLow}   MASS ${massKg.toFixed(0)} kg${overTxt}${cargoTxt}${comfortTxt}\n` +
     `WIND ${String(Math.round(windFromDeg)).padStart(3, '0')}° @ ${windKt.toFixed(0)} kt\n` +
     `→${nearestName}: ${nearestDistKm.toFixed(1)} km (${nearestDistFt.toFixed(0)} ft)  brg ${String(Math.round(nearestBearing)).padStart(3, '0')}° ${relArrow}\n` +
     mouseLine +

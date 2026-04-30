@@ -19,6 +19,7 @@ interface SaveData {
   milesFlown?: number;
   repairsTotal?: number;
   fleet?: SerializedFleet;
+  unlockedAchievements?: string[];
 }
 
 export function loadSave(missions: MissionSystem): Fleet {
@@ -43,6 +44,9 @@ export function loadSave(missions: MissionSystem): Fleet {
       w.timeOfDay = d.timeOfDay;
     }
     if (d.fleet) fleet = Fleet.fromSerialized(d.fleet);
+    if (Array.isArray(d.unlockedAchievements)) {
+      missions.unlockedAchievements = new Set(d.unlockedAchievements);
+    }
   } catch {
     /* ignore corrupt save */
   }
@@ -62,6 +66,7 @@ export function writeSave(missions: MissionSystem, fleet: Fleet) {
       milesFlown: missions.milesFlown,
       repairsTotal: missions.repairsTotal,
       fleet: fleet.serialize(),
+      unlockedAchievements: Array.from(missions.unlockedAchievements),
     };
     localStorage.setItem(KEY, JSON.stringify(data));
   } catch {

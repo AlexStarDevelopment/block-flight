@@ -26,6 +26,54 @@ export interface CityBuildings {
   // Per-frame update — toggles per-zone visibility based on camera distance
   // so suburbs disappear when you fly out of city, freeing GPU work.
   update(cameraPos: THREE.Vector3): void;
+  // 0 = full daylight, 1 = deep night. Drives a warm window-glow term
+  // injected into the building shader so cities light up after sunset.
+  setNightFactor(nightFactor: number): void;
+}
+
+// Shared uniform — every building material references this same object, so
+// one assignment per frame lights up the entire city.
+const NIGHT_UNIFORM: { value: number } = { value: 0 };
+
+function makeBuildingMaterial(): THREE.MeshLambertMaterial {
+  const mat = new THREE.MeshLambertMaterial({ vertexColors: true });
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uNightFactor = NIGHT_UNIFORM;
+    shader.fragmentShader =
+      'uniform float uNightFactor;\n' + shader.fragmentShader;
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <opaque_fragment>',
+      `
+      #ifdef USE_COLOR
+        {
+          // Detect window-ish vertex colors: blue-dominant (windowDay) or
+          // warm yellow (windowGlow). Walls in the palette are mostly neutral
+          // pastels, concrete, or muted earth tones, so this picks out
+          // windows without a per-vertex flag.
+          vec3 vc = vColor.rgb;
+          float bluish = vc.b - max(vc.r, vc.g);
+          float warmish = min(vc.r, vc.g) - vc.b;
+          float windowness = clamp(max(bluish, warmish) * 4.0, 0.0, 1.0);
+          // Gate by luminance — dark glass walls (glassBlue) read as blue
+          // too but are dim; this filter keeps the glow on bright window
+          // stripes only.
+          float lum = dot(vc, vec3(0.299, 0.587, 0.114));
+          windowness *= smoothstep(0.45, 0.7, lum);
+          vec3 warmGlow = vec3(1.0, 0.82, 0.45);
+          // Replace the dim night-side colour on window vertices with a bright
+          // warm glow so windows actually pop against a dark city. Walls glow
+          // weakly via the residual additive term so the building silhouette
+          // doesn't disappear.
+          float glow = windowness * uNightFactor;
+          outgoingLight = mix(outgoingLight, warmGlow * 1.6, glow);
+          outgoingLight += warmGlow * 0.06 * uNightFactor * (1.0 - windowness);
+        }
+      #endif
+      #include <opaque_fragment>
+      `,
+    );
+  };
+  return mat;
 }
 
 // Distance LOD thresholds (metres from CITY_CENTER 0,0 to camera position).
@@ -96,7 +144,7 @@ export function buildCity(): CityBuildings {
   // Build one InstancedMesh per prototype.
   for (const { proto, lots } of instancesByProto.values()) {
     if (lots.length === 0) continue;
-    const mat = new THREE.MeshLambertMaterial({ vertexColors: true });
+    const mat = makeBuildingMaterial();
     const mesh = new THREE.InstancedMesh(proto.geometry, mat, lots.length);
     const m = new THREE.Matrix4();
     const rot = new THREE.Matrix4();
@@ -145,6 +193,9 @@ export function buildCity(): CityBuildings {
       for (const m of suburbMeshes)   m.visible = showSuburb;
       for (const m of midriseMeshes)  m.visible = showMidrise;
       for (const m of downtownMeshes) m.visible = showDowntown;
+    },
+    setNightFactor(nightFactor: number) {
+      NIGHT_UNIFORM.value = Math.max(0, Math.min(1, nightFactor));
     },
   };
 }

@@ -11,7 +11,8 @@ export type UpgradeKind =
   | 'prop_climb'
   | 'tank'
   | 'vortex_gen'      // STOL: lower stall speed via +clMax + alphaStall.
-  | 'alpine_tires';   // Better braking on snow / ice.
+  | 'alpine_tires'    // Better braking on snow / ice.
+  | 'floats';         // Amphibious pontoons — land on water + lakes.
 
 export interface Upgrade {
   kind: UpgradeKind;
@@ -82,6 +83,14 @@ export const UPGRADES: UpgradeSpec[] = [
     apply: (p, lvl) => lvl > 0
       ? { ...p, iceBrakeBonus: 2.6, iceSlipBonus: 1.8 }
       : p,
+  },
+  {
+    kind: 'floats',
+    name: 'Amphibious floats',
+    description: 'Pontoons + retractable wheels — land on water OR runways. Unlocks sea bases.',
+    maxLevel: 1,
+    costPerLevel: (c) => Math.max(4000, Math.round(c * 0.30)),
+    apply: (p, lvl) => lvl > 0 ? { ...p, hasFloats: true } : p,
   },
 ];
 
@@ -176,6 +185,23 @@ export class Fleet {
     if (existing) existing.level += 1;
     else this.active().upgrades.push({ kind, level: 1 });
     return cost;
+  }
+
+  // Remove ONE level of an upgrade from the active plane. Returns the refund
+  // amount (full price for the level being removed), or null if there's nothing
+  // to remove. The hangar UI calls this for unequip.
+  sellUpgrade(kind: UpgradeKind): number | null {
+    const spec = UPGRADES.find(u => u.kind === kind);
+    if (!spec) return null;
+    const cur = this.upgradeLevel(kind);
+    if (cur <= 0) return null;
+    const refund = spec.costPerLevel(PLANES[this.active().id].cost);
+    const ups = this.active().upgrades;
+    const idx = ups.findIndex(x => x.kind === kind);
+    if (idx < 0) return null;
+    ups[idx].level -= 1;
+    if (ups[idx].level <= 0) ups.splice(idx, 1);
+    return refund;
   }
 
   serialize(): SerializedFleet {
