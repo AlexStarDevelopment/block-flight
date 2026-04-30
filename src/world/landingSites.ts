@@ -63,8 +63,9 @@ export const LANDING_SITES: LandingSite[] = [
   // surrounded by ocean — over-water approach with no diversion options.
   { name: 'Atoll',         cx:  7500, cz: -1500, elev: 36, surface: 'sand',   length: 130, width: 14, heading: 0, theme: 'flat',   difficulty: 'hard'       },
   // === Sea plane bases — water-only, dock-based. Require floats. ===
-  // Eagle Cove — NE forest coast lake.
-  { name: 'Eagle Cove',    cx:  2200, cz:  2400, elev: 28, surface: 'sand',   length: 200, width: 20, heading: 0, theme: 'water',  difficulty: 'medium',     isSeaplaneBase: true },
+  // Eagle Cove — tucked into a small cove at the foot of the NE mountains,
+  // east shore ~80 m off so the dock physically attaches to land.
+  { name: 'Eagle Cove',    cx:  2600, cz:  2400, elev: 28, surface: 'sand',   length: 200, width: 20, heading: 0, theme: 'water',  difficulty: 'medium',     isSeaplaneBase: true },
   // Tropic Bay — open water in the eastern archipelago, between islands.
   { name: 'Tropic Bay',    cx:  6800, cz:  -200, elev: 28, surface: 'sand',   length: 220, width: 20, heading: 0, theme: 'water',  difficulty: 'medium',     isSeaplaneBase: true },
   // Marina Point — west coastal marina. Sits ~100 m off the natural mainland
@@ -104,9 +105,12 @@ export function landingSiteThemeDelta(x: number, z: number): number {
     // hard so the area always falls below SEA_LEVEL=28 and water fills in.
     if (s.isSeaplaneBase) {
       const dist0 = Math.hypot(dx, dz);
-      // Marina Point uses a tight carve so the natural eastern shoreline
-      // (~100 m east of center) stays intact for the dock/pier to attach to.
-      if (s.name === 'Marina Point') {
+      // Tight carve for shore-anchored seaplane bases: keeps the natural
+      // shoreline ~80-100 m east intact so the dock/pier attaches to real
+      // land instead of carved water on every side. Eagle Cove also sits
+      // against natural mountains north of center — the small carve keeps
+      // those visible too.
+      if (s.name === 'Marina Point' || s.name === 'Eagle Cove') {
         const r = 180;
         if (dist0 > r) continue;
         const w0 = 1 - dist0 / r;

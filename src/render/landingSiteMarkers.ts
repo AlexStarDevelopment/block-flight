@@ -193,16 +193,18 @@ function addSeaplaneDock(
   // the natural shoreline ~100 m east; other seaplane bases stay with a
   // short ramp into a sheltered cove.
   const isMarina = s.name === 'Marina Point';
-  // Marina Point: pier ends at the natural shoreline (~50 m east of dock end).
-  const rampLen = isMarina ? 50 : 8;
+  const isEagleCove = s.name === 'Eagle Cove';
+  // Shore-anchored bases get a long pier reaching natural land east of dock.
+  const longPier = isMarina || isEagleCove;
+  const rampLen = longPier ? 50 : 8;
   const ramp = new THREE.Mesh(
     new THREE.BoxGeometry(rampLen, 0.3, 3),
     matDeck,
   );
   ramp.position.set(s.cx + 32 + rampLen / 2, deckY - 0.3, s.cz);
   group.add(ramp);
-  // Pier pilings every 8 m so the long Marina Point pier reads visually.
-  if (isMarina) {
+  // Pier pilings every 8 m so the long shore pier reads visually.
+  if (longPier) {
     for (let px = 36; px <= 32 + rampLen - 4; px += 8) {
       for (const dz of [-1.6, 1.6]) {
         const post = new THREE.Mesh(
@@ -262,6 +264,86 @@ function addSeaplaneDock(
   group.add(fill);
 
   if (isMarina) addMarinaEmbellishments(group, s, deckY);
+  if (isEagleCove) addEagleCoveCabin(group, s, deckY);
+}
+
+// Eagle Cove only: a cozy log cabin on the natural east shore, visible from
+// the dock with the mountains rising behind it.
+function addEagleCoveCabin(group: THREE.Group, s: LandingSite, deckY: number) {
+  const matLog    = new THREE.MeshLambertMaterial({ color: 0x6e4a30 });
+  const matLogDark= new THREE.MeshLambertMaterial({ color: 0x4a3220 });
+  const matRoof   = new THREE.MeshLambertMaterial({ color: 0x3a3028 });
+  const matChimney= new THREE.MeshLambertMaterial({ color: 0x5a534a });
+  const matDoor   = new THREE.MeshLambertMaterial({ color: 0x3a2818 });
+  const matWindow = new THREE.MeshLambertMaterial({ color: 0xfde58a });   // warm lit
+  const matSmoke  = new THREE.MeshLambertMaterial({ color: 0xd0d0d0 });
+
+  const VOX = VOXEL_SIZE;
+  const cbX = s.cx + 100;
+  const cbZ = s.cz - 8;
+  const groundH = heightAt(Math.floor(cbX), Math.floor(cbZ));
+  const groundTop = Math.floor(groundH / VOX) * VOX + VOX;
+  const baseY = Math.max(deckY + 1, groundTop + 0.4);
+
+  // Log walls (slightly stacked horizontal slabs for cabin texture).
+  const w = 9, d = 7, h = 4;
+  for (let i = 0; i < 4; i++) {
+    const slab = new THREE.Mesh(
+      new THREE.BoxGeometry(w, 1.0, d),
+      i % 2 === 0 ? matLog : matLogDark,
+    );
+    slab.position.set(cbX, baseY + 0.5 + i * 1.0, cbZ);
+    group.add(slab);
+  }
+  // Pitched roof — three stepped slabs.
+  for (let i = 0; i < 3; i++) {
+    const t = i / 3;
+    const rw = (w + 1) * (1 - t * 0.5);
+    const rd = (d + 1) * (1 - t * 0.5);
+    const slab = new THREE.Mesh(new THREE.BoxGeometry(rw, 0.7, rd), matRoof);
+    slab.position.set(cbX, baseY + h + 0.35 + i * 0.7, cbZ);
+    group.add(slab);
+  }
+  // Chimney with a wisp of smoke.
+  const chimney = new THREE.Mesh(new THREE.BoxGeometry(1.0, 4.0, 1.0), matChimney);
+  chimney.position.set(cbX + 3, baseY + h + 1.5, cbZ + 2.5);
+  group.add(chimney);
+  for (let i = 0; i < 3; i++) {
+    const puff = new THREE.Mesh(
+      new THREE.BoxGeometry(1.4 + i * 0.3, 0.6, 1.4 + i * 0.3),
+      matSmoke,
+    );
+    puff.position.set(cbX + 3, baseY + h + 4.0 + i * 1.0, cbZ + 2.5 + i * 0.3);
+    group.add(puff);
+  }
+  // Front door facing the pier.
+  const door = new THREE.Mesh(new THREE.BoxGeometry(0.2, 2.4, 1.4), matDoor);
+  door.position.set(cbX - w / 2 - 0.05, baseY + 1.2, cbZ);
+  group.add(door);
+  // Warm-lit windows on each wall.
+  for (const [wx, wz, ww, wd] of [
+    [-w / 2 - 0.05, -2.0, 0.2, 1.4],
+    [-w / 2 - 0.05,  2.0, 0.2, 1.4],
+    [ w / 2 + 0.05, -2.0, 0.2, 1.4],
+    [ w / 2 + 0.05,  2.0, 0.2, 1.4],
+    [ -2.0, -d / 2 - 0.05, 1.4, 0.2],
+    [  2.0, -d / 2 - 0.05, 1.4, 0.2],
+    [ -2.0,  d / 2 + 0.05, 1.4, 0.2],
+    [  2.0,  d / 2 + 0.05, 1.4, 0.2],
+  ] as const) {
+    const win = new THREE.Mesh(new THREE.BoxGeometry(ww, 1.4, wd), matWindow);
+    win.position.set(cbX + wx, baseY + 2.2, cbZ + wz);
+    group.add(win);
+  }
+  // Short stone path of two flat slabs from cabin door toward the pier.
+  for (let i = 0; i < 3; i++) {
+    const slab = new THREE.Mesh(
+      new THREE.BoxGeometry(1.2, 0.2, 0.8),
+      matChimney,
+    );
+    slab.position.set(cbX - w / 2 - 1.5 - i * 1.5, baseY + 0.05, cbZ);
+    group.add(slab);
+  }
 }
 
 // Marina Point only: extra finger piers, moored motorboats + sailboats, and
