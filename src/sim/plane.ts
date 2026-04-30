@@ -456,15 +456,16 @@ export class Plane {
           const speed = Math.hypot(vForward, vSide);
           let totalCoef: number;
           if (speed < 5) {
-            totalCoef = 0.07;
+            totalCoef = 0.12;                    // displacement plowing — water "feels heavy"
           } else if (speed < 11) {
             const t = (speed - 5) / 6;
-            totalCoef = 0.07 + 0.13 * t;        // ramp up to hump peak (0.20)
+            totalCoef = 0.12 + 0.08 * t;         // ramp up to hump peak (0.20)
           } else if (speed < 16) {
             const t = (speed - 11) / 5;
-            totalCoef = 0.20 - 0.16 * t;        // breaking onto step
+            totalCoef = 0.20 - 0.14 * t;         // breaking onto step → 0.06
           } else {
-            totalCoef = 0.035;                  // planing
+            totalCoef = 0.06;                    // planing — still meaningful so landings
+                                                  // decelerate visibly without throttle
           }
           const dragCoefPerGear = totalCoef * mass / 3;
           if (Math.abs(vForward) > 0.01) {
