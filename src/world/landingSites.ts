@@ -67,8 +67,9 @@ export const LANDING_SITES: LandingSite[] = [
   { name: 'Eagle Cove',    cx:  2200, cz:  2400, elev: 28, surface: 'sand',   length: 200, width: 20, heading: 0, theme: 'water',  difficulty: 'medium',     isSeaplaneBase: true },
   // Tropic Bay — open water in the eastern archipelago, between islands.
   { name: 'Tropic Bay',    cx:  6800, cz:  -200, elev: 28, surface: 'sand',   length: 220, width: 20, heading: 0, theme: 'water',  difficulty: 'medium',     isSeaplaneBase: true },
-  // Marina Point — far west coastal lake.
-  { name: 'Marina Point',  cx: -3500, cz:  -800, elev: 28, surface: 'sand',   length: 200, width: 20, heading: 0, theme: 'water',  difficulty: 'hard',       isSeaplaneBase: true },
+  // Marina Point — west coastal marina. Sits ~100 m off the natural mainland
+  // shoreline so the dock + pier physically attach to land.
+  { name: 'Marina Point',  cx: -3150, cz:  -800, elev: 28, surface: 'sand',   length: 200, width: 20, heading: 0, theme: 'water',  difficulty: 'hard',       isSeaplaneBase: true },
 ];
 
 
@@ -102,8 +103,18 @@ export function landingSiteThemeDelta(x: number, z: number): number {
     // surrounding biome (forest hills can sit 60+ m above sea level). Carve
     // hard so the area always falls below SEA_LEVEL=28 and water fills in.
     if (s.isSeaplaneBase) {
-      const r = 600;
       const dist0 = Math.hypot(dx, dz);
+      // Marina Point uses a tight carve so the natural eastern shoreline
+      // (~100 m east of center) stays intact for the dock/pier to attach to.
+      if (s.name === 'Marina Point') {
+        const r = 180;
+        if (dist0 > r) continue;
+        const w0 = 1 - dist0 / r;
+        const ws0 = w0 * w0 * w0 * (w0 * (w0 * 6 - 15) + 10);
+        total += -50 * ws0;
+        continue;
+      }
+      const r = 600;
       if (dist0 > r) continue;
       const w0 = 1 - dist0 / r;
       const ws0 = w0 * w0 * w0 * (w0 * (w0 * 6 - 15) + 10);

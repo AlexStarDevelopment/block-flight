@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { LANDING_SITES, TIGHT_WATER_SITES, type LandingSite } from '../world/landingSites';
-import { SEA_LEVEL } from '../world/terrain';
+import { SEA_LEVEL, heightAt } from '../world/terrain';
 import { VOXEL_SIZE } from '../world/voxel';
 import { buildWindsock } from './windsock';
 
@@ -189,13 +189,31 @@ function addSeaplaneDock(
       group.add(cleat);
     }
   }
-  // Walkway connecting dock to land (short ramp east).
+  // Walkway connecting dock to land. Marina Point gets a long pier reaching
+  // the natural shoreline ~100 m east; other seaplane bases stay with a
+  // short ramp into a sheltered cove.
+  const isMarina = s.name === 'Marina Point';
+  // Marina Point: pier ends at the natural shoreline (~50 m east of dock end).
+  const rampLen = isMarina ? 50 : 8;
   const ramp = new THREE.Mesh(
-    new THREE.BoxGeometry(8, 0.3, 3),
+    new THREE.BoxGeometry(rampLen, 0.3, 3),
     matDeck,
   );
-  ramp.position.set(s.cx + 36, deckY - 0.3, s.cz);
+  ramp.position.set(s.cx + 32 + rampLen / 2, deckY - 0.3, s.cz);
   group.add(ramp);
+  // Pier pilings every 8 m so the long Marina Point pier reads visually.
+  if (isMarina) {
+    for (let px = 36; px <= 32 + rampLen - 4; px += 8) {
+      for (const dz of [-1.6, 1.6]) {
+        const post = new THREE.Mesh(
+          new THREE.BoxGeometry(0.3, 4, 0.3),
+          matPost,
+        );
+        post.position.set(s.cx + px, deckY - 2.0, s.cz + dz);
+        group.add(post);
+      }
+    }
+  }
   // Tall identification pole at the north end of the dock with a flag.
   const matPoleBody = new THREE.MeshLambertMaterial({ color: 0xfafafa });
   const matPoleFlag = new THREE.MeshBasicMaterial({ color: 0x2e88a0 });
@@ -242,6 +260,143 @@ function addSeaplaneDock(
   );
   fill.position.set(zx, zoneY - 0.01, zz);
   group.add(fill);
+
+  if (isMarina) addMarinaEmbellishments(group, s, deckY);
+}
+
+// Marina Point only: extra finger piers, moored motorboats + sailboats, and
+// a small boathouse on the natural land just east of the long pier. Geometry
+// is voxel-blocky to match the rest of the world's aesthetic.
+function addMarinaEmbellishments(group: THREE.Group, s: LandingSite, deckY: number) {
+  const matDeck = new THREE.MeshLambertMaterial({ color: 0x6a4a2a });
+  const matPost = new THREE.MeshLambertMaterial({ color: 0x4a3220 });
+  const matHullWhite = new THREE.MeshLambertMaterial({ color: 0xeae6dc });
+  const matHullRed   = new THREE.MeshLambertMaterial({ color: 0xb04030 });
+  const matHullBlue  = new THREE.MeshLambertMaterial({ color: 0x2c5878 });
+  const matCabin     = new THREE.MeshLambertMaterial({ color: 0x404a52 });
+  const matMast      = new THREE.MeshLambertMaterial({ color: 0xb4b4b4 });
+  const matSail      = new THREE.MeshLambertMaterial({ color: 0xf6f0e0 });
+  const matRoofRed   = new THREE.MeshLambertMaterial({ color: 0x8a3020 });
+  const matWall      = new THREE.MeshLambertMaterial({ color: 0xc8b282 });
+  const matWindow    = new THREE.MeshLambertMaterial({ color: 0x6a8aa6 });
+
+  const SEA_TOP = deckY - 1.0;             // visible water surface
+  const cx = s.cx;
+  const cz = s.cz;
+
+  // === Finger pier — perpendicular to main dock, attached to its north end. ===
+  const fp = new THREE.Mesh(new THREE.BoxGeometry(2.5, 0.4, 22), matDeck);
+  fp.position.set(cx + 4, deckY, cz - 18);   // runs N from main dock
+  group.add(fp);
+  for (const dz of [-26, -18, -10]) {
+    const post = new THREE.Mesh(new THREE.BoxGeometry(0.3, 4, 0.3), matPost);
+    post.position.set(cx + 4, deckY - 2, cz + dz);
+    group.add(post);
+  }
+
+  // === Motorboat helper. Small boxy hull + cabin floating at the surface. ===
+  function placeMotorboat(bx: number, bz: number, rotY: number, hull: THREE.MeshLambertMaterial) {
+    const g = new THREE.Group();
+    g.position.set(bx, SEA_TOP, bz);
+    g.rotation.y = rotY;
+    const hullMesh = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.7, 6.4), hull);
+    hullMesh.position.y = 0.35;
+    g.add(hullMesh);
+    // Bow taper — narrower box on the front so it reads as a pointed bow.
+    const bow = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.6, 1.4), hull);
+    bow.position.set(0, 0.35, 3.6);
+    g.add(bow);
+    // Cabin box
+    const cabin = new THREE.Mesh(new THREE.BoxGeometry(2.0, 1.0, 2.4), matCabin);
+    cabin.position.set(0, 1.1, -0.3);
+    g.add(cabin);
+    // Windshield (just a colored slab)
+    const ws = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.6, 0.1), matWindow);
+    ws.position.set(0, 1.4, 0.9);
+    g.add(ws);
+    group.add(g);
+  }
+  // Three motorboats tied along main dock + finger pier.
+  placeMotorboat(cx + 18, cz + 9.5, 0, matHullWhite);   // south side of main dock
+  placeMotorboat(cx + 28, cz + 9.5, 0, matHullRed);
+  placeMotorboat(cx + 8.5, cz - 14, Math.PI / 2, matHullBlue);   // west side of finger pier
+
+  // === Sailboat helper. Hull + tall mast + triangular-ish sail (boxy). ===
+  function placeSailboat(bx: number, bz: number, rotY: number) {
+    const g = new THREE.Group();
+    g.position.set(bx, SEA_TOP, bz);
+    g.rotation.y = rotY;
+    const hullMesh = new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.8, 8.0), matHullWhite);
+    hullMesh.position.y = 0.4;
+    g.add(hullMesh);
+    const bow = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.7, 1.6), matHullWhite);
+    bow.position.set(0, 0.4, 4.4);
+    g.add(bow);
+    // Cockpit cutout (lower box on stern)
+    const cockpit = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.5, 2.2), matCabin);
+    cockpit.position.set(0, 0.95, -2.4);
+    g.add(cockpit);
+    // Mast — tall vertical pole.
+    const mast = new THREE.Mesh(new THREE.BoxGeometry(0.18, 11, 0.18), matMast);
+    mast.position.set(0, 6.0, 0.4);
+    g.add(mast);
+    // Boom along the cabin top.
+    const boom = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.18, 4.4), matMast);
+    boom.position.set(0, 1.7, -1.6);
+    g.add(boom);
+    // Mainsail — wide-near-boom, narrow-near-top. Approximate with two slabs.
+    const sailLow = new THREE.Mesh(new THREE.BoxGeometry(0.05, 4.0, 3.6), matSail);
+    sailLow.position.set(0, 4.0, -0.5);
+    g.add(sailLow);
+    const sailHigh = new THREE.Mesh(new THREE.BoxGeometry(0.05, 3.5, 1.6), matSail);
+    sailHigh.position.set(0, 8.5, 0.0);
+    g.add(sailHigh);
+    group.add(g);
+  }
+  // Two sailboats moored further out.
+  placeSailboat(cx - 4, cz - 22, Math.PI / 2);
+  placeSailboat(cx - 4, cz + 22, -Math.PI / 2);
+
+  // === Boathouse — small wooden shack on the natural shore east of pier. ===
+  // Sample real terrain height so the foundation sits on the natural shore
+  // rather than floating or burying. Natural land east of the new Marina
+  // Point center rises sharply (h=34→50) so this matters.
+  const bhX = cx + 110;
+  const bhZ = cz - 4;
+  const VOX = VOXEL_SIZE;
+  const groundH = heightAt(Math.floor(bhX), Math.floor(bhZ));
+  const groundTop = Math.floor(groundH / VOX) * VOX + VOX;
+  const bhBaseY = Math.max(deckY + 1, groundTop + 0.5);
+  const foundation = new THREE.Mesh(new THREE.BoxGeometry(14, 1.0, 12), matDeck);
+  foundation.position.set(bhX, bhBaseY - 0.5, bhZ);
+  group.add(foundation);
+  const wall = new THREE.Mesh(new THREE.BoxGeometry(12, 5, 10), matWall);
+  wall.position.set(bhX, bhBaseY + 2.5, bhZ);
+  group.add(wall);
+  // Pitched roof (three stepped slabs)
+  for (let i = 0; i < 3; i++) {
+    const t = i / 3;
+    const rw = 13 * (1 - t * 0.55);
+    const rd = 11 * (1 - t * 0.55);
+    const rh = 0.7;
+    const slab = new THREE.Mesh(new THREE.BoxGeometry(rw, rh, rd), matRoofRed);
+    slab.position.set(bhX, bhBaseY + 5.0 + i * rh, bhZ);
+    group.add(slab);
+  }
+  // Big garage-style door facing the water (west side).
+  const door = new THREE.Mesh(new THREE.BoxGeometry(0.2, 3.6, 5.0), matCabin);
+  door.position.set(bhX - 6.05, bhBaseY + 1.8, bhZ);
+  group.add(door);
+  // Two side windows
+  for (const dz of [-3.4, 3.4]) {
+    const w = new THREE.Mesh(new THREE.BoxGeometry(0.2, 1.4, 1.4), matWindow);
+    w.position.set(bhX - 6.05, bhBaseY + 3.4, bhZ + dz);
+    group.add(w);
+  }
+  // Sign on roof front
+  const sign = new THREE.Mesh(new THREE.BoxGeometry(0.15, 1.2, 4.0), matWall);
+  sign.position.set(bhX - 6.7, bhBaseY + 5.3, bhZ);
+  group.add(sign);
 }
 
 // Per-name landmarks — match the strip's identity. Cabins get cabins, piers
