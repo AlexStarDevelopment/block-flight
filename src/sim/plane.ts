@@ -435,24 +435,43 @@ export class Plane {
         const vSide = _horizV.dot(_right);
         _fricForce.set(0, 0, 0);
         if (onWater) {
-          // Water drag, per gear contact. Tuned so a Cub on floats can plane
-          // up and reach takeoff speed at full throttle. Real Cub on water:
-          // 25 kt (13 m/s) on step, 40 kt (20 m/s) liftoff.
+          // Water drag, per gear contact (3 contacts → divide by 3 to get
+          // total). Models the four real seaplane regimes:
           //
-          // Below step (plowing): ~quadratic, peak hump drag ~25 % of weight
-          //   so the plane has to "push through" the hump but full thrust
-          //   wins. Above step (planing): much lower coefficient, so the
-          //   plane accelerates freely toward takeoff speed.
-          const stepSpeed = 13;
+          //   Displacement (0-5 m/s)  — gentle drag, plane plowing slowly.
+          //   Hump rise (5-11 m/s)    — bow wave grows; drag climbs sharply.
+          //   Peak hump (~11 m/s)     — drag ≈ 27 % of weight; thrust margin
+          //                              is razor-thin, so heavily loaded
+          //                              planes really struggle to break free.
+          //   Breaking onto step      — drag falls as float climbs out of
+          //   (11-16 m/s)              its bow wave.
+          //   Planing (>16 m/s)       — float on top of water, low drag,
+          //                              accelerates freely to liftoff at
+          //                              ~20 m/s (40 kt).
+          //
+          // At idle the same drag curve acts as effective brakes — a Cub on
+          // step decelerates back through the hump within ~10 s without power.
+          // Tuned so a Cub on EDO floats hits ~25-35 s and ~250-350 m water
+          // run at full throttle, matching real PA-18 on EDO 2000 numbers.
           const speed = Math.hypot(vForward, vSide);
-          const dragCoef = speed < stepSpeed
-            ? 0.10 * mass * (1 - speed / stepSpeed * 0.5)
-            : 0.022 * mass;
-          if (Math.abs(vForward) > 0.01) {
-            _fricForce.addScaledVector(_fwd, -Math.sign(vForward) * dragCoef * Math.abs(vForward));
+          let totalCoef: number;
+          if (speed < 5) {
+            totalCoef = 0.07;
+          } else if (speed < 11) {
+            const t = (speed - 5) / 6;
+            totalCoef = 0.07 + 0.13 * t;        // ramp up to hump peak (0.20)
+          } else if (speed < 16) {
+            const t = (speed - 11) / 5;
+            totalCoef = 0.20 - 0.16 * t;        // breaking onto step
+          } else {
+            totalCoef = 0.035;                  // planing
           }
-          // Lateral water drag — pontoons resist sideslip but not so hard
-          // that you can't yaw the plane around with rudder.
+          const dragCoefPerGear = totalCoef * mass / 3;
+          if (Math.abs(vForward) > 0.01) {
+            _fricForce.addScaledVector(_fwd, -Math.sign(vForward) * dragCoefPerGear * Math.abs(vForward));
+          }
+          // Lateral water drag — pontoons resist sideslip strongly but not
+          // so hard you can't kick a turn with rudder.
           if (Math.abs(vSide) > 0.01) {
             _fricForce.addScaledVector(_right, -Math.sign(vSide) * mass * 1.2 * Math.abs(vSide));
           }
